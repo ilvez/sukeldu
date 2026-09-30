@@ -371,6 +371,11 @@ impl ApplicationHandler for App {
             w.request_redraw();
         }
     }
+
+    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        self.gpu = None;
+        self.window = None;
+    }
 }
 
 fn parse_args() -> Option<View> {
