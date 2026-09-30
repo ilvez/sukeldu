@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use rug::{Float, Integer};
 
 pub const TILE: u32 = 256;
-pub const DIRECT_MAX_LEVEL: u32 = 46;
+pub const MAX_COMPUTE_LEVEL: u32 = 900;
 
 const MAX_LOG2_UPP: f64 = -4.321928094887362;
 const PREC_STEP: u32 = 64;
@@ -30,7 +30,7 @@ impl TileKey {
         4.0 * 2f64.powi(-(level as i32))
     }
 
-    // NOTE: f64 origin and step are exact only up to DIRECT_MAX_LEVEL.
+    // NOTE: the f64 origin is exact only while the index fits 53 bits (level <= 52); deeper tiles are placed relative to a reference point instead.
     pub fn origin(&self) -> (f64, f64) {
         let s = Self::world_size(self.level);
         (-2.0 + self.ix.to_f64() * s, -2.0 + self.iy.to_f64() * s)
@@ -69,6 +69,7 @@ pub struct Cache {
     map: HashMap<TileKey, u32>,
     slots: Vec<Option<Slot>>,
     free: Vec<u32>,
+    max_ready_level: u32,
 }
 
 impl Cache {
@@ -77,7 +78,13 @@ impl Cache {
             map: HashMap::new(),
             slots: vec![None; layers as usize],
             free: (0..layers).rev().collect(),
+            max_ready_level: 0,
         }
+    }
+
+    // NOTE: an upper bound, not lowered on eviction; it only lets the ancestor search skip levels that cannot hold a computed tile.
+    pub fn max_ready_level(&self) -> u32 {
+        self.max_ready_level
     }
 
     // NOTE: only fully computed tiles are returned; a tile still being sliced in must not be drawn.
@@ -113,6 +120,15 @@ impl Cache {
         if let Some(slot) = self.slots[layer as usize].as_mut() {
             slot.ready = true;
             slot.last_used = frame;
+            self.max_ready_level = self.max_ready_level.max(slot.key.level);
+        }
+    }
+
+    // NOTE: only for tiles still being computed; their layer is freed without ever having been drawn.
+    pub fn cancel(&mut self, key: &TileKey) {
+        if let Some(layer) = self.map.remove(key) {
+            self.slots[layer as usize] = None;
+            self.free.push(layer);
         }
     }
 
@@ -199,6 +215,24 @@ impl View {
             format!("{:.*}", decimals, self.world_axis(&self.cx)),
             format!("{:.*}", decimals, self.world_axis(&self.cy)),
         )
+    }
+
+    pub fn centre_world(&self, bits: u32) -> (Float, Float) {
+        (
+            Float::with_val(bits, self.world_axis(&self.cx)),
+            Float::with_val(bits, self.world_axis(&self.cy)),
+        )
+    }
+
+    pub fn offset_px(&self, cx: &Float, cy: &Float) -> (f64, f64) {
+        let scale = Float::with_val(64, -self.log2_upp).exp2();
+        let axis = |fixed: &Integer, c: &Float| {
+            let mut d = self.world_axis(fixed);
+            d -= c;
+            d *= &scale;
+            d.to_f64()
+        };
+        (axis(&self.cx, cx), axis(&self.cy, cy))
     }
 
     pub fn add_pixels(&mut self, dx: f64, dy: f64) {
@@ -323,7 +357,7 @@ fn to_fixed(world: &Float, prec: u32) -> Integer {
 }
 
 fn frac_in_tile(centre: &Integer, tile: &Integer, shift: u32) -> f64 {
-    let rel = Integer::from(centre - Integer::from(tile << shift));
+    let rel = centre - Integer::from(tile << shift);
     (Float::with_val(64, &rel) >> shift).to_f64()
 }
 

@@ -36,6 +36,9 @@ AMD GPU under Linux. Rust + wgpu (Vulkan/RADV) + winit.
   units-per-pixel on a second line. Nothing else on screen.
 - **Reproducible locations.** `C` prints the current location as
   `--at CX CY UPP` to stdout; `sukeldu --at CX CY UPP` starts there.
+  `--perturb-from N` switches tiles at level N and deeper to perturbation
+  (default 36; 0 renders everything but the root tile that way, for
+  comparing the two paths at one location).
 
 ## Architecture
 
@@ -53,9 +56,18 @@ AMD GPU under Linux. Rust + wgpu (Vulkan/RADV) + winit.
   frames, under a per-frame slice budget that adapts to the frame time so the
   frame rate stays at the display refresh even when one tile costs more than a
   frame. A tile is drawn only once all its slices are done.
-- **Shaders.** `src/shaders/compute.wgsl` iterates one tile (fp64).
-  `src/shaders/render.wgsl` maps iteration counts to colours and draws the
-  tile quads plus the text overlay.
+- **Shaders.** `src/shaders/compute.wgsl` iterates one tile directly in fp64
+  (shallow levels). `src/shaders/perturb.wgsl` iterates one tile as deltas
+  against a reference orbit, with rebasing, so one reference is valid for
+  every pixel. `src/shaders/render.wgsl` maps iteration counts to colours and
+  draws the tile quads plus the text overlay.
+- **Reference orbits.** `src/reference.rs` computes one arbitrary-precision
+  orbit (MPFR) on a worker thread, stored as f64 pairs and uploaded to a GPU
+  buffer. A reference serves tiles within 2^30 tile-pixels of it and up to 32
+  levels deeper than the level it was made for; a replacement is requested
+  before either limit is reached. Tiles that no reference serves are not
+  scheduled, so their ancestors stay on screen. Installing a new reference
+  cancels perturbation tiles still in flight; finished tiles are kept.
 
 ## Toolchain
 
@@ -72,8 +84,11 @@ toward boundary detail, depth readout, 2×2 supersampling in the compute
 shader, fixed palette (hue from log2 of the smooth count, 20% brightness
 banding on the raw count). The view centre is fixed-point arbitrary precision
 (`rug`) and tile keys are big integers, so the zoom itself has no depth limit.
-Tiles are still computed in plain fp64 and only up to level 46; deeper views
-magnify the level-46 tiles until perturbation is implemented.
+Tiles from level 36 on are computed by perturbation with f64 deltas, up to
+level 900 (about 1e-273 units per pixel); deeper views magnify the level-900
+tiles. Perturbation has no interior shortcut yet, so interior pixels run to
+the iteration limit, and a single dispatch can still exceed a frame at very
+high iteration counts.
 
 ## Open work, in order
 
@@ -89,12 +104,12 @@ magnify the level-46 tiles until perturbation is implemented.
    - a flat, bland region (pink screenshot at depth 10^12.7, level 45) and a
      jagged black-filament region (depth 10^5.4, level 21) still need their
      `--at` lines recorded (press `C` there).
-3. **Perturbation rendering.** One arbitrary-precision reference orbit per
-   region on the CPU (MPFR/rug or astro-float), per-pixel deltas on the GPU
-   in f32 (with an exponent-extended form past ~1e-38), bilinear
-   approximation to skip iterations, and glitch detection with re-reference.
-   This removes the depth ceiling and makes deep tiles cheap, which is what
-   pays for supersampling and higher iteration counts.
+3. **Perturbation speed and range.** Exponent-extended deltas past level 900
+   (removes the last depth limit), bilinear approximation to skip iterations
+   (makes deep and interior tiles cheap, which is what pays for supersampling
+   and higher iteration counts), per-pixel state carried across dispatches so
+   one slice never exceeds a frame, and an f32 inner loop where it matches the
+   f64 images.
 4. **Iteration budget.** The per-level formula
    (`150 + 100 × 1.12^level`) is a guess; near minibrots it leaves black
    areas that should have detail. Needs an adaptive rule (e.g. raise while a

@@ -8,6 +8,7 @@ use crate::tiles::TILE;
 pub const MAX_DISPATCH: usize = 256;
 pub const MAX_INSTANCES: usize = 4096;
 const PARAMS_STRIDE: u64 = 256;
+const ORBIT_ENTRY_BYTES: u64 = 16;
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -18,7 +19,8 @@ struct Params {
     max_iter: u32,
     row0: u32,
     samples: u32,
-    _pad: [u32; 2],
+    ref_len: u32,
+    _pad: u32,
 }
 
 #[repr(C)]
@@ -44,6 +46,8 @@ pub struct Job {
     pub max_iter: u32,
     pub row0: u32,
     pub samples: u32,
+    pub perturb: bool,
+    pub ref_len: u32,
 }
 
 #[repr(C)]
@@ -61,9 +65,13 @@ pub struct Gpu {
     surface: wgpu::Surface<'static>,
     pub config: wgpu::SurfaceConfiguration,
     compute_pipeline: wgpu::ComputePipeline,
+    perturb_pipeline: wgpu::ComputePipeline,
+    compute_bgl: wgpu::BindGroupLayout,
     compute_bg: wgpu::BindGroup,
     params_buf: wgpu::Buffer,
+    orbit_buf: wgpu::Buffer,
     tile_tex: wgpu::Texture,
+    tile_view: wgpu::TextureView,
     render_pipeline: wgpu::RenderPipeline,
     render_bg: wgpu::BindGroup,
     globals_buf: wgpu::Buffer,
@@ -155,26 +163,21 @@ impl Gpu {
                     },
                     count: None,
                 },
-            ],
-        });
-        let compute_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
-            layout: &compute_bgl,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                        buffer: &params_buf,
-                        offset: 0,
-                        size: NonZeroU64::new(std::mem::size_of::<Params>() as u64),
-                    }),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&tile_view),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
                 },
             ],
         });
+        let orbit_buf = Self::create_orbit_buffer(&device, 2 * ORBIT_ENTRY_BYTES);
+        let compute_bg =
+            Self::compute_bind_group(&device, &compute_bgl, &params_buf, &tile_view, &orbit_buf);
         let compute_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: None,
             bind_group_layouts: &[&compute_bgl],
@@ -184,6 +187,18 @@ impl Gpu {
             label: Some("mandel"),
             layout: Some(&compute_layout),
             module: &compute_module,
+            entry_point: Some("main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        let perturb_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("perturb"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/perturb.wgsl").into()),
+        });
+        let perturb_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("mandel-perturb"),
+            layout: Some(&compute_layout),
+            module: &perturb_module,
             entry_point: Some("main"),
             compilation_options: Default::default(),
             cache: None,
@@ -379,9 +394,13 @@ impl Gpu {
             surface,
             config,
             compute_pipeline,
+            perturb_pipeline,
+            compute_bgl,
             compute_bg,
             params_buf,
+            orbit_buf,
             tile_tex,
+            tile_view,
             render_pipeline,
             render_bg,
             globals_buf,
@@ -390,6 +409,22 @@ impl Gpu {
             text_pipeline,
             text_tex,
         }
+    }
+
+    pub fn upload_orbit(&mut self, orbit: &[[f64; 2]]) {
+        let bytes: &[u8] = bytemuck::cast_slice(orbit);
+        if bytes.len() as u64 > self.orbit_buf.size() {
+            self.orbit_buf =
+                Self::create_orbit_buffer(&self.device, (bytes.len() as u64).next_power_of_two());
+            self.compute_bg = Self::compute_bind_group(
+                &self.device,
+                &self.compute_bgl,
+                &self.params_buf,
+                &self.tile_view,
+                &self.orbit_buf,
+            );
+        }
+        self.queue.write_buffer(&self.orbit_buf, 0, bytes);
     }
 
     pub fn write_text(&self, pixels: &[u8]) {
@@ -445,7 +480,8 @@ impl Gpu {
                 max_iter: job.max_iter,
                 row0: job.row0,
                 samples: job.samples,
-                _pad: [0; 2],
+                ref_len: job.ref_len,
+                _pad: 0,
             };
             self.queue.write_buffer(
                 &self.params_buf,
@@ -466,8 +502,16 @@ impl Gpu {
                 label: None,
                 timestamp_writes: None,
             });
-            pass.set_pipeline(&self.compute_pipeline);
-            for i in 0..jobs.len() {
+            let mut perturb_bound = None;
+            for (i, job) in jobs.iter().enumerate() {
+                if perturb_bound != Some(job.perturb) {
+                    pass.set_pipeline(if job.perturb {
+                        &self.perturb_pipeline
+                    } else {
+                        &self.compute_pipeline
+                    });
+                    perturb_bound = Some(job.perturb);
+                }
                 pass.set_bind_group(0, &self.compute_bg, &[(i as u64 * PARAMS_STRIDE) as u32]);
                 pass.dispatch_workgroups(TILE / 16, SLICE_ROWS / 16, 1);
             }
@@ -532,5 +576,67 @@ impl Gpu {
         let data: Vec<f32> = bytemuck::cast_slice(&slice.get_mapped_range()).to_vec();
         self.readback_buf.unmap();
         data
+    }
+
+    fn create_orbit_buffer(device: &wgpu::Device, size: u64) -> wgpu::Buffer {
+        device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("orbit"),
+            size,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        })
+    }
+
+    fn compute_bind_group(
+        device: &wgpu::Device,
+        layout: &wgpu::BindGroupLayout,
+        params_buf: &wgpu::Buffer,
+        tile_view: &wgpu::TextureView,
+        orbit_buf: &wgpu::Buffer,
+    ) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: params_buf,
+                        offset: 0,
+                        size: NonZeroU64::new(std::mem::size_of::<Params>() as u64),
+                    }),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(tile_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: orbit_buf.as_entire_binding(),
+                },
+            ],
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use wgpu::naga::{front::wgsl, valid};
+
+    fn validate(source: &str) {
+        let module = wgsl::parse_str(source).expect("wgsl parses");
+        valid::Validator::new(valid::ValidationFlags::all(), valid::Capabilities::FLOAT64)
+            .validate(&module)
+            .expect("wgsl validates");
+    }
+
+    #[test]
+    fn direct_shader_is_valid() {
+        validate(include_str!("shaders/compute.wgsl"));
+    }
+
+    #[test]
+    fn perturbation_shader_is_valid() {
+        validate(include_str!("shaders/perturb.wgsl"));
     }
 }

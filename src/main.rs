@@ -1,8 +1,10 @@
 mod gpu;
+mod reference;
 mod text;
 mod tiles;
 
 use std::sync::Arc;
+use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::Instant;
 
 use winit::application::ApplicationHandler;
@@ -13,19 +15,26 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Fullscreen, Window, WindowId};
 
 use gpu::{Globals, Gpu, Instance, Job, MAX_DISPATCH, MAX_INSTANCES, SLICE_ROWS};
-use tiles::{Cache, DIRECT_MAX_LEVEL, TILE, TileKey, View};
+use reference::{LEVEL_REFRESH_MARGIN, LEVEL_SPAN, MAX_DISTANCE_PX, Orbit, Reference};
+use tiles::{Cache, MAX_COMPUTE_LEVEL, TILE, TileKey, View};
 
 const LAYERS: u32 = 1536;
 const FALLBACK_LEVELS: u32 = 4;
 const AUTOPILOT_PERIOD: u64 = 15;
+const DEFAULT_PERTURB_FROM_LEVEL: u32 = 36;
+const FALLBACK_WALK: u32 = 12;
+const MAX_FALLBACK_UP: u32 = 60;
 
 struct Pending {
     layer: u32,
+    key: TileKey,
     origin: [f64; 2],
     step: f64,
     max_iter: u32,
     next_row: u32,
     samples: u32,
+    perturb: bool,
+    ref_len: u32,
 }
 
 struct App {
@@ -47,10 +56,13 @@ struct App {
     iter_mult: f64,
     samples: u32,
     text: String,
+    perturb_from: u32,
+    reference: Option<Reference>,
+    incoming: Option<Receiver<(Reference, Orbit)>>,
 }
 
 impl App {
-    fn new(start: Option<View>) -> Self {
+    fn new(start: Option<View>, perturb_from: u32) -> Self {
         App {
             window: None,
             gpu: None,
@@ -70,6 +82,9 @@ impl App {
             iter_mult: 1.0,
             samples: 2,
             text: String::new(),
+            perturb_from,
+            reference: None,
+            incoming: None,
         }
     }
 
@@ -157,18 +172,21 @@ impl App {
             let (ox, oy) = root.origin();
             self.pending.push(Pending {
                 layer,
+                key: root.clone(),
                 origin: [ox, oy],
                 step: root.step(),
                 max_iter: self.max_iter(0),
                 next_row: 0,
                 samples: self.samples,
+                perturb: false,
+                ref_len: 0,
             });
         }
         self.cache.get(&root, self.frame);
 
         // NOTE: tiles are computed in row slices across frames; keep a few tiles in flight so the slice budget is always usable.
         if self.pending.len() < 4 {
-            let mut wanted: Vec<(f64, TileKey)> = Vec::new();
+            let mut wanted: Vec<(f64, TileKey, Option<[f64; 2]>)> = Vec::new();
             let first = level.saturating_sub(FALLBACK_LEVELS);
             for l in first..=level {
                 for key in self.view.visible_tiles(l, w, h) {
@@ -176,23 +194,41 @@ impl App {
                         self.cache.get(&key, self.frame);
                         continue;
                     }
+                    let offset = if l >= self.perturb_from {
+                        let Some(offset) = self.reference.as_ref().and_then(|r| r.locate(&key))
+                        else {
+                            continue;
+                        };
+                        Some(offset)
+                    } else {
+                        None
+                    };
                     let (x0, y0, x1, y1) = self.view.tile_rect(&key, w, h);
                     let (dx, dy) = ((x0 + x1) / 2.0 - focus.0, (y0 + y1) / 2.0 - focus.1);
                     let d = (dx * dx + dy * dy).sqrt();
-                    wanted.push((d + (level - l) as f64 * -1e9, key));
+                    wanted.push((d + (level - l) as f64 * -1e9, key, offset));
                 }
             }
             wanted.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-            for (_, key) in wanted.into_iter().take(8) {
+            for (_, key, offset) in wanted.into_iter().take(8) {
                 if let Some(layer) = self.cache.alloc(key.clone(), self.frame) {
-                    let (ox, oy) = key.origin();
+                    let (origin, perturb) = match offset {
+                        Some(offset) => (offset, true),
+                        None => {
+                            let (ox, oy) = key.origin();
+                            ([ox, oy], false)
+                        }
+                    };
                     self.pending.push(Pending {
                         layer,
-                        origin: [ox, oy],
+                        origin,
                         step: key.step(),
                         max_iter: self.max_iter(key.level),
                         next_row: 0,
                         samples: self.samples,
+                        perturb,
+                        ref_len: self.reference.as_ref().map_or(0, |r| r.len),
+                        key,
                     });
                 }
             }
@@ -209,6 +245,8 @@ impl App {
                     max_iter: p.max_iter,
                     row0: p.next_row,
                     samples: p.samples,
+                    perturb: p.perturb,
+                    ref_len: p.ref_len,
                 });
                 p.next_row += SLICE_ROWS;
                 slices -= 1;
@@ -239,7 +277,8 @@ impl App {
 
         self.step_motion(dt);
 
-        let level = self.view.target_level().min(DIRECT_MAX_LEVEL);
+        let level = self.view.target_level().min(MAX_COMPUTE_LEVEL);
+        self.update_reference(level);
         if self.autopilot && self.frame % AUTOPILOT_PERIOD == 0 {
             if let Some((key, layer)) = self.centre_tile_layer(level) {
                 let data = self.gpu.as_ref().unwrap().read_layer(layer);
@@ -255,17 +294,15 @@ impl App {
         let jobs = self.schedule(level, focus, w, h);
 
         let mut instances: Vec<Instance> = Vec::new();
+        let first_up = level.saturating_sub(self.cache.max_ready_level());
+        let last_up = (first_up + FALLBACK_WALK).min(level).min(MAX_FALLBACK_UP);
         for key in self.view.visible_tiles(level, w, h) {
-            let mut up = 0;
-            let layer = loop {
-                let k = key.ancestor(up);
-                if let Some(layer) = self.cache.get(&k, self.frame) {
-                    break layer;
-                }
-                if k.level == 0 {
-                    break 0;
-                }
-                up += 1;
+            let frame = self.frame;
+            let cache = &mut self.cache;
+            let found = (first_up..=last_up)
+                .find_map(|up| cache.get(&key.ancestor(up), frame).map(|layer| (layer, up)));
+            let Some((layer, up)) = found else {
+                continue;
             };
             let (x0, y0, x1, y1) = self.view.tile_rect(&key, w, h);
             instances.push(Instance {
@@ -319,6 +356,45 @@ impl App {
             ));
         }
         gpu.frame(&jobs, &instances, globals);
+    }
+
+    fn update_reference(&mut self, level: u32) {
+        let arrived = self.incoming.as_ref().map(|rx| rx.try_recv());
+        match arrived {
+            Some(Ok((reference, orbit))) => {
+                self.incoming = None;
+                self.install_reference(reference, orbit);
+            }
+            Some(Err(TryRecvError::Disconnected)) => self.incoming = None,
+            Some(Err(TryRecvError::Empty)) | None => {}
+        }
+        if self.incoming.is_none() && level >= self.perturb_from && self.reference_is_stale(level) {
+            let (cx, cy) = self.view.centre_world(reference::bits_for(level));
+            let max_iter = self.max_iter(level + LEVEL_SPAN);
+            self.incoming = Some(reference::spawn(cx, cy, level, max_iter));
+        }
+    }
+
+    fn install_reference(&mut self, reference: Reference, orbit: Orbit) {
+        self.gpu.as_mut().unwrap().upload_orbit(&orbit);
+        let cache = &mut self.cache;
+        self.pending.retain(|p| {
+            if p.perturb {
+                cache.cancel(&p.key);
+            }
+            !p.perturb
+        });
+        self.reference = Some(reference);
+    }
+
+    fn reference_is_stale(&self, level: u32) -> bool {
+        match &self.reference {
+            None => true,
+            Some(r) => {
+                level + LEVEL_REFRESH_MARGIN > r.level + LEVEL_SPAN
+                    || r.distance_px(&self.view) > MAX_DISTANCE_PX / 2.0
+            }
+        }
     }
 }
 
@@ -422,9 +498,17 @@ fn parse_args() -> Option<View> {
     View::at(args.get(i + 1)?, args.get(i + 2)?, args.get(i + 3)?)
 }
 
+fn parse_perturb_from() -> u32 {
+    let args: Vec<String> = std::env::args().collect();
+    args.iter()
+        .position(|a| a == "--perturb-from")
+        .and_then(|i| args.get(i + 1)?.parse().ok())
+        .unwrap_or(DEFAULT_PERTURB_FROM_LEVEL)
+}
+
 fn main() {
     let event_loop = EventLoop::new().expect("event loop");
     event_loop.set_control_flow(ControlFlow::Poll);
-    let mut app = App::new(parse_args());
+    let mut app = App::new(parse_args(), parse_perturb_from());
     event_loop.run_app(&mut app).expect("run");
 }
