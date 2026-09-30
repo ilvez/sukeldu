@@ -70,8 +70,10 @@ driver (`vulkan-radeon`), already present on this machine.
 Initial version: fp64 on the GPU, tile cache, continuous zoom, autopilot
 toward boundary detail, depth readout, 2×2 supersampling in the compute
 shader, fixed palette (hue from log2 of the smooth count, 20% brightness
-banding on the raw count). Perturbation for depths beyond 1e-15 is not
-implemented yet; the zoom stops at level 48.
+banding on the raw count). The view centre is fixed-point arbitrary precision
+(`rug`) and tile keys are big integers, so the zoom itself has no depth limit.
+Tiles are still computed in plain fp64 and only up to level 46; deeper views
+magnify the level-46 tiles until perturbation is implemented.
 
 ## Open work, in order
 

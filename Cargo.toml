@@ -8,6 +8,7 @@ wgpu = "26"
 winit = "0.30"
 pollster = "0.4"
 bytemuck = { version = "1", features = ["derive"] }
+rug = { version = "1", default-features = false, features = ["integer", "float"] }
 
 [profile.release]
 opt-level = 3

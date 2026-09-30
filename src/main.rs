@@ -13,7 +13,7 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Fullscreen, Window, WindowId};
 
 use gpu::{Globals, Gpu, Instance, Job, MAX_DISPATCH, MAX_INSTANCES, SLICE_ROWS};
-use tiles::{Cache, TILE, TileKey, View};
+use tiles::{Cache, DIRECT_MAX_LEVEL, TILE, TileKey, View};
 
 const LAYERS: u32 = 1536;
 const FALLBACK_LEVELS: u32 = 4;
@@ -21,7 +21,8 @@ const AUTOPILOT_PERIOD: u64 = 15;
 
 struct Pending {
     layer: u32,
-    key: TileKey,
+    origin: [f64; 2],
+    step: f64,
     max_iter: u32,
     next_row: u32,
     samples: u32,
@@ -33,7 +34,7 @@ struct App {
     cache: Cache,
     view: View,
     start: Option<View>,
-    home_upp: f64,
+    home_log2_upp: f64,
     frame: u64,
     last: Instant,
     budget: usize,
@@ -42,7 +43,7 @@ struct App {
     cursor: (f64, f64),
     dragging: bool,
     autopilot: bool,
-    target: Option<(f64, f64)>,
+    target: Option<(TileKey, f64, f64)>,
     iter_mult: f64,
     samples: u32,
     text: String,
@@ -56,7 +57,7 @@ impl App {
             cache: Cache::new(LAYERS),
             view: View::home(),
             start,
-            home_upp: 1.0,
+            home_log2_upp: 0.0,
             frame: 0,
             last: Instant::now(),
             budget: 16,
@@ -73,20 +74,11 @@ impl App {
     }
 
     fn centre_tile_layer(&mut self, level: u32) -> Option<(TileKey, u32)> {
-        let (w, h) = self.size();
-        let (cx, cy) = self
-            .view
-            .screen_to_world(w as f64 / 2.0, h as f64 / 2.0, w, h);
-        let s = TileKey::world_size(level);
-        let key = TileKey {
-            level,
-            ix: ((cx + 2.0) / s).floor() as i64,
-            iy: ((cy + 2.0) / s).floor() as i64,
-        };
+        let key = self.view.centre_key(level);
         let mut up = 0;
         loop {
             let k = key.ancestor(up);
-            if let Some(layer) = self.cache.get(k, self.frame) {
+            if let Some(layer) = self.cache.get(&k, self.frame) {
                 return Some((k, layer));
             }
             if k.level == 0 {
@@ -110,7 +102,7 @@ impl App {
         let (w, h) = self.size();
         self.view = View::home();
         self.view.fit(w, h);
-        self.home_upp = self.view.upp;
+        self.home_log2_upp = self.view.log2_upp;
         if let Some(v) = self.start.take() {
             self.view = v;
         }
@@ -122,10 +114,10 @@ impl App {
         let (w, h) = self.size();
         let (mut fx, mut fy) = self.cursor;
         if self.autopilot {
-            if let Some((tx, ty)) = self.target {
+            if let Some((key, u, v)) = &self.target {
                 let k = (3.0 * dt).min(1.0);
-                self.view.cx += (tx - self.view.cx) * k;
-                self.view.cy += (ty - self.view.cy) * k;
+                let (dx, dy) = self.view.pixels_to(key, *u, *v);
+                self.view.add_pixels(dx * k, dy * k);
             }
             fx = w as f64 / 2.0;
             fy = h as f64 / 2.0;
@@ -137,13 +129,8 @@ impl App {
     }
 
     fn update_autopilot_target(&mut self, found: TileKey, data: &[f32]) {
-        let (w, h) = self.size();
-        let (cx, cy) = self
-            .view
-            .screen_to_world(w as f64 / 2.0, h as f64 / 2.0, w, h);
-        let (ox, oy) = found.origin();
-        let step = found.step();
-        let (px, py) = (((cx - ox) / step) as i64, ((cy - oy) / step) as i64);
+        let (fx, fy) = self.view.tile_frac(&found);
+        let (px, py) = ((fx * TILE as f64) as i64, (fy * TILE as f64) as i64);
         let mut best = (f32::MIN, 0usize);
         for (i, v) in data.iter().enumerate() {
             let (x, y) = ((i % TILE as usize) as i64, (i / TILE as usize) as i64);
@@ -159,28 +146,25 @@ impl App {
                 (best.1 % TILE as usize) as f64,
                 (best.1 / TILE as usize) as f64,
             );
-            self.target = Some((ox + (x + 0.5) * step, oy + (y + 0.5) * step));
+            self.target = Some((found, (x + 0.5) / TILE as f64, (y + 0.5) / TILE as f64));
         }
     }
 
     fn schedule(&mut self, level: u32, focus: (f64, f64), w: u32, h: u32) -> Vec<Job> {
-        let (focus_x, focus_y) = self.view.screen_to_world(focus.0, focus.1, w, h);
-        let root = TileKey {
-            level: 0,
-            ix: 0,
-            iy: 0,
-        };
-        if !self.cache.contains(root) {
-            let layer = self.cache.alloc(root, self.frame).unwrap();
+        let root = TileKey::root();
+        if !self.cache.contains(&root) {
+            let layer = self.cache.alloc(root.clone(), self.frame).unwrap();
+            let (ox, oy) = root.origin();
             self.pending.push(Pending {
                 layer,
-                key: root,
+                origin: [ox, oy],
+                step: root.step(),
                 max_iter: self.max_iter(0),
                 next_row: 0,
                 samples: self.samples,
             });
         }
-        self.cache.get(root, self.frame);
+        self.cache.get(&root, self.frame);
 
         // NOTE: tiles are computed in row slices across frames; keep a few tiles in flight so the slice budget is always usable.
         if self.pending.len() < 4 {
@@ -188,23 +172,24 @@ impl App {
             let first = level.saturating_sub(FALLBACK_LEVELS);
             for l in first..=level {
                 for key in self.view.visible_tiles(l, w, h) {
-                    if self.cache.contains(key) {
-                        self.cache.get(key, self.frame);
+                    if self.cache.contains(&key) {
+                        self.cache.get(&key, self.frame);
                         continue;
                     }
-                    let (ox, oy) = key.origin();
-                    let half = TileKey::world_size(l) / 2.0;
-                    let d = ((ox + half - focus_x).powi(2) + (oy + half - focus_y).powi(2)).sqrt()
-                        / self.view.upp;
+                    let (x0, y0, x1, y1) = self.view.tile_rect(&key, w, h);
+                    let (dx, dy) = ((x0 + x1) / 2.0 - focus.0, (y0 + y1) / 2.0 - focus.1);
+                    let d = (dx * dx + dy * dy).sqrt();
                     wanted.push((d + (level - l) as f64 * -1e9, key));
                 }
             }
             wanted.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
             for (_, key) in wanted.into_iter().take(8) {
-                if let Some(layer) = self.cache.alloc(key, self.frame) {
+                if let Some(layer) = self.cache.alloc(key.clone(), self.frame) {
+                    let (ox, oy) = key.origin();
                     self.pending.push(Pending {
                         layer,
-                        key,
+                        origin: [ox, oy],
+                        step: key.step(),
                         max_iter: self.max_iter(key.level),
                         next_row: 0,
                         samples: self.samples,
@@ -219,7 +204,8 @@ impl App {
             while slices > 0 && p.next_row < TILE {
                 jobs.push(Job {
                     layer: p.layer,
-                    key: p.key,
+                    origin: p.origin,
+                    step: p.step,
                     max_iter: p.max_iter,
                     row0: p.next_row,
                     samples: p.samples,
@@ -253,7 +239,7 @@ impl App {
 
         self.step_motion(dt);
 
-        let level = self.view.target_level();
+        let level = self.view.target_level().min(DIRECT_MAX_LEVEL);
         if self.autopilot && self.frame % AUTOPILOT_PERIOD == 0 {
             if let Some((key, layer)) = self.centre_tile_layer(level) {
                 let data = self.gpu.as_ref().unwrap().read_layer(layer);
@@ -273,7 +259,7 @@ impl App {
             let mut up = 0;
             let layer = loop {
                 let k = key.ancestor(up);
-                if let Some(layer) = self.cache.get(k, self.frame) {
+                if let Some(layer) = self.cache.get(&k, self.frame) {
                     break layer;
                 }
                 if k.level == 0 {
@@ -281,10 +267,7 @@ impl App {
                 }
                 up += 1;
             };
-            let (ox, oy) = key.origin();
-            let s = TileKey::world_size(level);
-            let (x0, y0) = self.view.world_to_screen(ox, oy, w, h);
-            let (x1, y1) = self.view.world_to_screen(ox + s, oy + s, w, h);
+            let (x0, y0, x1, y1) = self.view.tile_rect(&key, w, h);
             instances.push(Instance {
                 rect: [x0 as f32, y0 as f32, x1 as f32, y1 as f32],
                 uv: key.uv_in_ancestor(up),
@@ -296,16 +279,17 @@ impl App {
             }
         }
 
-        let mag = (self.home_upp / self.view.upp).log10();
+        let mag = self.view.depth_log10(self.home_log2_upp);
+        let (wx, wy) = self.view.world();
         let text = format!(
-            "depth 10^{:.1}  level {}  iter {}  ss {}\nx {:.17}  y {:.17}  upp {:.3e}",
+            "depth 10^{:.1}  level {}  iter {}  ss {}\nx {:.17}  y {:.17}  upp {}",
             mag,
             level,
             self.max_iter(level),
             self.samples,
-            self.view.cx,
-            self.view.cy,
-            self.view.upp
+            wx,
+            wy,
+            self.view.upp_string(3)
         );
         let text_changed = text != self.text;
         self.text = text;
@@ -366,8 +350,7 @@ impl ApplicationHandler for App {
                 if self.dragging {
                     let dx = position.x - self.cursor.0;
                     let dy = position.y - self.cursor.1;
-                    self.view.cx -= dx * self.view.upp;
-                    self.view.cy -= dy * self.view.upp;
+                    self.view.add_pixels(-dx, -dy);
                 }
                 self.cursor = (position.x, position.y);
             }
@@ -395,10 +378,10 @@ impl ApplicationHandler for App {
                     }
                     PhysicalKey::Code(KeyCode::KeyH) => self.go_home(),
                     PhysicalKey::Code(KeyCode::KeyS) => self.samples = self.samples % 3 + 1,
-                    PhysicalKey::Code(KeyCode::KeyC) => println!(
-                        "--at {:.17} {:.17} {:.6e}",
-                        self.view.cx, self.view.cy, self.view.upp
-                    ),
+                    PhysicalKey::Code(KeyCode::KeyC) => {
+                        let (x, y) = self.view.world_strings();
+                        println!("--at {} {} {}", x, y, self.view.upp_string(12));
+                    }
                     PhysicalKey::Code(KeyCode::KeyF) => {
                         let win = self.window.as_ref().unwrap();
                         let fs = if win.fullscreen().is_some() {
@@ -436,10 +419,7 @@ impl ApplicationHandler for App {
 fn parse_args() -> Option<View> {
     let args: Vec<String> = std::env::args().collect();
     let i = args.iter().position(|a| a == "--at")?;
-    let cx = args.get(i + 1)?.parse().ok()?;
-    let cy = args.get(i + 2)?.parse().ok()?;
-    let upp = args.get(i + 3)?.parse().ok()?;
-    Some(View { cx, cy, upp })
+    View::at(args.get(i + 1)?, args.get(i + 2)?, args.get(i + 3)?)
 }
 
 fn main() {

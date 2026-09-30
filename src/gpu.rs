@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use winit::window::Window;
 
-use crate::tiles::{TILE, TileKey};
+use crate::tiles::TILE;
 
 pub const MAX_DISPATCH: usize = 256;
 pub const MAX_INSTANCES: usize = 4096;
@@ -39,7 +39,8 @@ pub const SLICE_ROWS: u32 = 32;
 
 pub struct Job {
     pub layer: u32,
-    pub key: TileKey,
+    pub origin: [f64; 2],
+    pub step: f64,
     pub max_iter: u32,
     pub row0: u32,
     pub samples: u32,
@@ -437,10 +438,9 @@ impl Gpu {
         let view = output.texture.create_view(&Default::default());
 
         for (i, job) in jobs.iter().enumerate() {
-            let (ox, oy) = job.key.origin();
             let p = Params {
-                origin: [ox, oy],
-                step: job.key.step(),
+                origin: job.origin,
+                step: job.step,
                 layer: job.layer,
                 max_iter: job.max_iter,
                 row0: job.row0,
