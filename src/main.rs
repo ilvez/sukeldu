@@ -1,3 +1,4 @@
+mod bla;
 mod gpu;
 mod reference;
 mod text;
@@ -14,8 +15,10 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Fullscreen, Window, WindowId};
 
-use gpu::{Globals, Gpu, Instance, Job, MAX_DISPATCH, MAX_INSTANCES, SLICE_ROWS};
-use reference::{LEVEL_REFRESH_MARGIN, LEVEL_SPAN, MAX_DISTANCE_PX, Orbit, Reference};
+use gpu::{
+    Globals, Gpu, Instance, Job, MAX_DISPATCH, MAX_INSTANCES, SLICE_ROWS, STATE_SLOTS, passes_for,
+};
+use reference::{Computed, LEVEL_REFRESH_MARGIN, LEVEL_SPAN, Located, MAX_DISTANCE_PX, Reference};
 use tiles::{Cache, MAX_COMPUTE_LEVEL, TILE, TileKey, View};
 
 const LAYERS: u32 = 1536;
@@ -31,10 +34,20 @@ struct Pending {
     origin: [f64; 2],
     step: f64,
     max_iter: u32,
-    next_row: u32,
+    next_unit: u32,
+    passes: u32,
+    slot: u32,
     samples: u32,
     perturb: bool,
     ref_len: u32,
+    bla_p: u32,
+    use_bla: bool,
+}
+
+impl Pending {
+    fn total_units(&self) -> u32 {
+        TILE / SLICE_ROWS * self.passes
+    }
 }
 
 struct App {
@@ -58,7 +71,8 @@ struct App {
     text: String,
     perturb_from: u32,
     reference: Option<Reference>,
-    incoming: Option<Receiver<(Reference, Orbit)>>,
+    incoming: Option<Receiver<Computed>>,
+    free_slots: Vec<u32>,
 }
 
 impl App {
@@ -85,6 +99,7 @@ impl App {
             perturb_from,
             reference: None,
             incoming: None,
+            free_slots: (0..STATE_SLOTS).collect(),
         }
     }
 
@@ -176,17 +191,21 @@ impl App {
                 origin: [ox, oy],
                 step: root.step(),
                 max_iter: self.max_iter(0),
-                next_row: 0,
+                next_unit: 0,
+                passes: 1,
+                slot: 0,
                 samples: self.samples,
                 perturb: false,
                 ref_len: 0,
+                bla_p: 0,
+                use_bla: false,
             });
         }
         self.cache.get(&root, self.frame);
 
         // NOTE: tiles are computed in row slices across frames; keep a few tiles in flight so the slice budget is always usable.
         if self.pending.len() < 4 {
-            let mut wanted: Vec<(f64, TileKey, Option<[f64; 2]>)> = Vec::new();
+            let mut wanted: Vec<(f64, TileKey, Option<Located>)> = Vec::new();
             let first = level.saturating_sub(FALLBACK_LEVELS);
             for l in first..=level {
                 for key in self.view.visible_tiles(l, w, h) {
@@ -194,40 +213,56 @@ impl App {
                         self.cache.get(&key, self.frame);
                         continue;
                     }
-                    let offset = if l >= self.perturb_from {
-                        let Some(offset) = self.reference.as_ref().and_then(|r| r.locate(&key))
+                    let located = if l >= self.perturb_from {
+                        let Some(located) = self.reference.as_ref().and_then(|r| r.locate(&key))
                         else {
                             continue;
                         };
-                        Some(offset)
+                        Some(located)
                     } else {
                         None
                     };
                     let (x0, y0, x1, y1) = self.view.tile_rect(&key, w, h);
                     let (dx, dy) = ((x0 + x1) / 2.0 - focus.0, (y0 + y1) / 2.0 - focus.1);
                     let d = (dx * dx + dy * dy).sqrt();
-                    wanted.push((d + (level - l) as f64 * -1e9, key, offset));
+                    wanted.push((d + (level - l) as f64 * -1e9, key, located));
                 }
             }
             wanted.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-            for (_, key, offset) in wanted.into_iter().take(8) {
+            for (_, key, located) in wanted.into_iter().take(8) {
+                if located.is_some() && self.free_slots.is_empty() {
+                    continue;
+                }
                 if let Some(layer) = self.cache.alloc(key.clone(), self.frame) {
-                    let (origin, perturb) = match offset {
-                        Some(offset) => (offset, true),
+                    let max_iter = self.max_iter(key.level);
+                    let (origin, perturb, use_bla) = match located {
+                        Some(located) => (located.offset, true, located.bla),
                         None => {
                             let (ox, oy) = key.origin();
-                            ([ox, oy], false)
+                            ([ox, oy], false, false)
                         }
+                    };
+                    let (slot, passes) = if perturb {
+                        (
+                            self.free_slots.pop().unwrap(),
+                            passes_for(max_iter, self.samples),
+                        )
+                    } else {
+                        (0, 1)
                     };
                     self.pending.push(Pending {
                         layer,
                         origin,
                         step: key.step(),
-                        max_iter: self.max_iter(key.level),
-                        next_row: 0,
+                        max_iter,
+                        next_unit: 0,
+                        passes,
+                        slot,
                         samples: self.samples,
                         perturb,
                         ref_len: self.reference.as_ref().map_or(0, |r| r.len),
+                        bla_p: self.reference.as_ref().map_or(0, |r| r.bla_p),
+                        use_bla,
                         key,
                     });
                 }
@@ -237,18 +272,22 @@ impl App {
         let mut jobs = Vec::new();
         let mut slices = self.budget.min(MAX_DISPATCH);
         for p in self.pending.iter_mut() {
-            while slices > 0 && p.next_row < TILE {
+            while slices > 0 && p.next_unit < p.total_units() {
                 jobs.push(Job {
                     layer: p.layer,
                     origin: p.origin,
                     step: p.step,
                     max_iter: p.max_iter,
-                    row0: p.next_row,
+                    row0: p.next_unit / p.passes * SLICE_ROWS,
                     samples: p.samples,
                     perturb: p.perturb,
                     ref_len: p.ref_len,
+                    bla_p: p.bla_p,
+                    use_bla: p.use_bla,
+                    slot: p.slot,
+                    pass: p.next_unit % p.passes,
                 });
-                p.next_row += SLICE_ROWS;
+                p.next_unit += 1;
                 slices -= 1;
             }
             if slices == 0 {
@@ -257,13 +296,16 @@ impl App {
         }
         let frame = self.frame;
         let cache = &mut self.cache;
+        let free_slots = &mut self.free_slots;
         self.pending.retain(|p| {
-            if p.next_row >= TILE {
-                cache.mark_ready(p.layer, frame);
-                false
-            } else {
-                true
+            if p.next_unit < p.total_units() {
+                return true;
             }
+            cache.mark_ready(p.layer, frame);
+            if p.perturb {
+                free_slots.push(p.slot);
+            }
+            false
         });
         jobs
     }
@@ -361,9 +403,9 @@ impl App {
     fn update_reference(&mut self, level: u32) {
         let arrived = self.incoming.as_ref().map(|rx| rx.try_recv());
         match arrived {
-            Some(Ok((reference, orbit))) => {
+            Some(Ok(computed)) => {
                 self.incoming = None;
-                self.install_reference(reference, orbit);
+                self.install_reference(computed);
             }
             Some(Err(TryRecvError::Disconnected)) => self.incoming = None,
             Some(Err(TryRecvError::Empty)) | None => {}
@@ -375,12 +417,22 @@ impl App {
         }
     }
 
-    fn install_reference(&mut self, reference: Reference, orbit: Orbit) {
-        self.gpu.as_mut().unwrap().upload_orbit(&orbit);
+    fn install_reference(&mut self, computed: Computed) {
+        let Computed {
+            reference,
+            orbit,
+            bla,
+        } = computed;
+        self.gpu
+            .as_mut()
+            .unwrap()
+            .upload_reference(&orbit, &bla.entries);
         let cache = &mut self.cache;
+        let free_slots = &mut self.free_slots;
         self.pending.retain(|p| {
             if p.perturb {
                 cache.cancel(&p.key);
+                free_slots.push(p.slot);
             }
             !p.perturb
         });

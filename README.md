@@ -55,11 +55,21 @@ AMD GPU under Linux. Rust + wgpu (Vulkan/RADV) + winit.
   zoom focus first. Each tile is computed in 32-row slices spread over
   frames, under a per-frame slice budget that adapts to the frame time so the
   frame rate stays at the display refresh even when one tile costs more than a
-  frame. A tile is drawn only once all its slices are done.
+  frame. A tile is drawn only once all its slices are done. Perturbation tiles
+  are resumable: each dispatch advances every pixel by at most `STEP_CAP`
+  iterations and saves its state (delta, reference index, sample, running
+  sum) in a per-tile slot of a GPU buffer, so one dispatch is bounded no
+  matter the iteration limit. The CPU issues the worst-case number of
+  dispatches per slice (`passes_for`); pixels that finished earlier return
+  immediately. At most 12 perturbation tiles are in flight (one slot each).
 - **Shaders.** `src/shaders/compute.wgsl` iterates one tile directly in fp64
   (shallow levels). `src/shaders/perturb.wgsl` iterates one tile as deltas
   against a reference orbit, with rebasing, so one reference is valid for
-  every pixel. `src/shaders/render.wgsl` maps iteration counts to colours and
+  every pixel, and with bilinear skipping: `src/bla.rs` builds, next to each
+  orbit, a table where an entry at level k replaces 2^k steps by one linear
+  step, valid while the delta is below the entry's radius. A tile may use it
+  only if its farthest pixel is within 2^16 pixels of the reference.
+  `src/shaders/render.wgsl` maps iteration counts to colours and
   draws the tile quads plus the text overlay.
 - **Reference orbits.** `src/reference.rs` computes one arbitrary-precision
   orbit (MPFR) on a worker thread, stored as f64 pairs and uploaded to a GPU
@@ -87,8 +97,9 @@ banding on the raw count). The view centre is fixed-point arbitrary precision
 Tiles from level 36 on are computed by perturbation with f64 deltas, up to
 level 900 (about 1e-273 units per pixel); deeper views magnify the level-900
 tiles. Perturbation has no interior shortcut yet, so interior pixels run to
-the iteration limit, and a single dispatch can still exceed a frame at very
-high iteration counts.
+the iteration limit (bilinear skipping shortens them only while the orbit
+stays close to the reference). Direct tiles (below level 36) still run each
+slice in a single dispatch.
 
 ## Open work, in order
 
@@ -105,11 +116,11 @@ high iteration counts.
      jagged black-filament region (depth 10^5.4, level 21) still need their
      `--at` lines recorded (press `C` there).
 3. **Perturbation speed and range.** Exponent-extended deltas past level 900
-   (removes the last depth limit), bilinear approximation to skip iterations
-   (makes deep and interior tiles cheap, which is what pays for supersampling
-   and higher iteration counts), per-pixel state carried across dispatches so
-   one slice never exceeds a frame, and an f32 inner loop where it matches the
-   f64 images.
+   (removes the last depth limit), tuning of the dispatch size (`STEP_CAP`) and
+   of the skip accuracy (`EPS` in
+   `src/bla.rs`) against reference screenshots, and an f32 inner loop where it
+   matches the f64 images. Cheap deep and interior tiles are what pays for
+   supersampling and higher iteration counts.
 4. **Iteration budget.** The per-level formula
    (`150 + 100 × 1.12^level`) is a guess; near minibrots it leaves black
    areas that should have detail. Needs an adaptive rule (e.g. raise while a
