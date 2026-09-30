@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use winit::window::Window;
 
-use crate::tiles::{TileKey, TILE};
+use crate::tiles::{TILE, TileKey};
 
 pub const MAX_DISPATCH: usize = 256;
 pub const MAX_INSTANCES: usize = 4096;
@@ -101,7 +101,11 @@ impl Gpu {
 
         let tile_tex = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("tiles"),
-            size: wgpu::Extent3d { width: TILE, height: TILE, depth_or_array_layers: layers },
+            size: wgpu::Extent3d {
+                width: TILE,
+                height: TILE,
+                depth_or_array_layers: layers,
+            },
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
@@ -164,7 +168,10 @@ impl Gpu {
                         size: NonZeroU64::new(std::mem::size_of::<Params>() as u64),
                     }),
                 },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&tile_view) },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&tile_view),
+                },
             ],
         });
         let compute_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -257,7 +264,11 @@ impl Gpu {
         });
         let text_tex = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("text"),
-            size: wgpu::Extent3d { width: TEXT_W, height: TEXT_H, depth_or_array_layers: 1 },
+            size: wgpu::Extent3d {
+                width: TEXT_W,
+                height: TEXT_H,
+                depth_or_array_layers: 1,
+            },
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
@@ -270,11 +281,26 @@ impl Gpu {
             label: None,
             layout: &render_bgl,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&tile_view) },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&sampler) },
-                wgpu::BindGroupEntry { binding: 2, resource: globals_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 3, resource: instance_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(&text_view) },
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&tile_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: globals_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: instance_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::TextureView(&text_view),
+                },
             ],
         });
         let render_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -374,8 +400,16 @@ impl Gpu {
                 aspect: wgpu::TextureAspect::All,
             },
             pixels,
-            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(TEXT_W), rows_per_image: Some(TEXT_H) },
-            wgpu::Extent3d { width: TEXT_W, height: TEXT_H, depth_or_array_layers: 1 },
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(TEXT_W),
+                rows_per_image: Some(TEXT_H),
+            },
+            wgpu::Extent3d {
+                width: TEXT_W,
+                height: TEXT_H,
+                depth_or_array_layers: 1,
+            },
         );
     }
 
@@ -413,16 +447,25 @@ impl Gpu {
                 samples: job.samples,
                 _pad: [0; 2],
             };
-            self.queue.write_buffer(&self.params_buf, i as u64 * PARAMS_STRIDE, bytemuck::bytes_of(&p));
+            self.queue.write_buffer(
+                &self.params_buf,
+                i as u64 * PARAMS_STRIDE,
+                bytemuck::bytes_of(&p),
+            );
         }
-        self.queue.write_buffer(&self.globals_buf, 0, bytemuck::bytes_of(&globals));
+        self.queue
+            .write_buffer(&self.globals_buf, 0, bytemuck::bytes_of(&globals));
         if !instances.is_empty() {
-            self.queue.write_buffer(&self.instance_buf, 0, bytemuck::cast_slice(instances));
+            self.queue
+                .write_buffer(&self.instance_buf, 0, bytemuck::cast_slice(instances));
         }
 
         let mut encoder = self.device.create_command_encoder(&Default::default());
         if !jobs.is_empty() {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes: None });
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: None,
+                timestamp_writes: None,
+            });
             pass.set_pipeline(&self.compute_pipeline);
             for i in 0..jobs.len() {
                 pass.set_bind_group(0, &self.compute_bg, &[(i as u64 * PARAMS_STRIDE) as u32]);
@@ -435,7 +478,10 @@ impl Gpu {
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,
                     resolve_target: None,
-                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
                     depth_slice: None,
                 })],
                 depth_stencil_attachment: None,
@@ -458,14 +504,26 @@ impl Gpu {
             wgpu::TexelCopyTextureInfo {
                 texture: &self.tile_tex,
                 mip_level: 0,
-                origin: wgpu::Origin3d { x: 0, y: 0, z: layer },
+                origin: wgpu::Origin3d {
+                    x: 0,
+                    y: 0,
+                    z: layer,
+                },
                 aspect: wgpu::TextureAspect::All,
             },
             wgpu::TexelCopyBufferInfo {
                 buffer: &self.readback_buf,
-                layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(TILE * 4), rows_per_image: Some(TILE) },
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(TILE * 4),
+                    rows_per_image: Some(TILE),
+                },
             },
-            wgpu::Extent3d { width: TILE, height: TILE, depth_or_array_layers: 1 },
+            wgpu::Extent3d {
+                width: TILE,
+                height: TILE,
+                depth_or_array_layers: 1,
+            },
         );
         self.queue.submit([encoder.finish()]);
         let slice = self.readback_buf.slice(..);

@@ -13,7 +13,7 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Fullscreen, Window, WindowId};
 
 use gpu::{Globals, Gpu, Instance, Job, MAX_DISPATCH, MAX_INSTANCES, SLICE_ROWS};
-use tiles::{Cache, TileKey, View, TILE};
+use tiles::{Cache, TILE, TileKey, View};
 
 const LAYERS: u32 = 1536;
 const FALLBACK_LEVELS: u32 = 4;
@@ -74,9 +74,15 @@ impl App {
 
     fn centre_tile_layer(&mut self, level: u32) -> Option<(TileKey, u32)> {
         let (w, h) = self.size();
-        let (cx, cy) = self.view.screen_to_world(w as f64 / 2.0, h as f64 / 2.0, w, h);
+        let (cx, cy) = self
+            .view
+            .screen_to_world(w as f64 / 2.0, h as f64 / 2.0, w, h);
         let s = TileKey::world_size(level);
-        let key = TileKey { level, ix: ((cx + 2.0) / s).floor() as i64, iy: ((cy + 2.0) / s).floor() as i64 };
+        let key = TileKey {
+            level,
+            ix: ((cx + 2.0) / s).floor() as i64,
+            iy: ((cy + 2.0) / s).floor() as i64,
+        };
         let mut up = 0;
         loop {
             let k = key.ancestor(up);
@@ -90,14 +96,14 @@ impl App {
         }
     }
 
-
     fn size(&self) -> (u32, u32) {
         let g = self.gpu.as_ref().unwrap();
         (g.config.width, g.config.height)
     }
 
     fn max_iter(&self, level: u32) -> u32 {
-        ((150.0 + 100.0 * 1.12f64.powi(level as i32)) * self.iter_mult).clamp(64.0, 200_000.0) as u32
+        ((150.0 + 100.0 * 1.12f64.powi(level as i32)) * self.iter_mult).clamp(64.0, 200_000.0)
+            as u32
     }
 
     fn go_home(&mut self) {
@@ -132,7 +138,9 @@ impl App {
 
     fn update_autopilot_target(&mut self, found: TileKey, data: &[f32]) {
         let (w, h) = self.size();
-        let (cx, cy) = self.view.screen_to_world(w as f64 / 2.0, h as f64 / 2.0, w, h);
+        let (cx, cy) = self
+            .view
+            .screen_to_world(w as f64 / 2.0, h as f64 / 2.0, w, h);
         let (ox, oy) = found.origin();
         let step = found.step();
         let (px, py) = (((cx - ox) / step) as i64, ((cy - oy) / step) as i64);
@@ -147,17 +155,30 @@ impl App {
             }
         }
         if best.0 > f32::MIN {
-            let (x, y) = ((best.1 % TILE as usize) as f64, (best.1 / TILE as usize) as f64);
+            let (x, y) = (
+                (best.1 % TILE as usize) as f64,
+                (best.1 / TILE as usize) as f64,
+            );
             self.target = Some((ox + (x + 0.5) * step, oy + (y + 0.5) * step));
         }
     }
 
     fn schedule(&mut self, level: u32, focus: (f64, f64), w: u32, h: u32) -> Vec<Job> {
         let (focus_x, focus_y) = self.view.screen_to_world(focus.0, focus.1, w, h);
-        let root = TileKey { level: 0, ix: 0, iy: 0 };
+        let root = TileKey {
+            level: 0,
+            ix: 0,
+            iy: 0,
+        };
         if !self.cache.contains(root) {
             let layer = self.cache.alloc(root, self.frame).unwrap();
-            self.pending.push(Pending { layer, key: root, max_iter: self.max_iter(0), next_row: 0, samples: self.samples });
+            self.pending.push(Pending {
+                layer,
+                key: root,
+                max_iter: self.max_iter(0),
+                next_row: 0,
+                samples: self.samples,
+            });
         }
         self.cache.get(root, self.frame);
 
@@ -173,14 +194,21 @@ impl App {
                     }
                     let (ox, oy) = key.origin();
                     let half = TileKey::world_size(l) / 2.0;
-                    let d = ((ox + half - focus_x).powi(2) + (oy + half - focus_y).powi(2)).sqrt() / self.view.upp;
+                    let d = ((ox + half - focus_x).powi(2) + (oy + half - focus_y).powi(2)).sqrt()
+                        / self.view.upp;
                     wanted.push((d + (level - l) as f64 * -1e9, key));
                 }
             }
             wanted.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
             for (_, key) in wanted.into_iter().take(8) {
                 if let Some(layer) = self.cache.alloc(key, self.frame) {
-                    self.pending.push(Pending { layer, key, max_iter: self.max_iter(key.level), next_row: 0, samples: self.samples });
+                    self.pending.push(Pending {
+                        layer,
+                        key,
+                        max_iter: self.max_iter(key.level),
+                        next_row: 0,
+                        samples: self.samples,
+                    });
                 }
             }
         }
@@ -189,7 +217,13 @@ impl App {
         let mut slices = self.budget.min(MAX_DISPATCH);
         for p in self.pending.iter_mut() {
             while slices > 0 && p.next_row < TILE {
-                jobs.push(Job { layer: p.layer, key: p.key, max_iter: p.max_iter, row0: p.next_row, samples: p.samples });
+                jobs.push(Job {
+                    layer: p.layer,
+                    key: p.key,
+                    max_iter: p.max_iter,
+                    row0: p.next_row,
+                    samples: p.samples,
+                });
                 p.next_row += SLICE_ROWS;
                 slices -= 1;
             }
@@ -227,7 +261,11 @@ impl App {
             }
         }
 
-        let focus = if self.autopilot { (w as f64 / 2.0, h as f64 / 2.0) } else { self.cursor };
+        let focus = if self.autopilot {
+            (w as f64 / 2.0, h as f64 / 2.0)
+        } else {
+            self.cursor
+        };
         let jobs = self.schedule(level, focus, w, h);
 
         let mut instances: Vec<Instance> = Vec::new();
@@ -290,7 +328,11 @@ impl App {
         };
         let gpu = self.gpu.as_mut().unwrap();
         if text_changed {
-            gpu.write_text(&text::rasterize(&self.text, gpu::TEXT_W as usize, gpu::TEXT_H as usize));
+            gpu.write_text(&text::rasterize(
+                &self.text,
+                gpu::TEXT_W as usize,
+                gpu::TEXT_H as usize,
+            ));
         }
         gpu.frame(&jobs, &instances, globals);
     }
@@ -301,7 +343,9 @@ impl ApplicationHandler for App {
         if self.window.is_some() {
             return;
         }
-        let attrs = Window::default_attributes().with_title("sukeldu").with_inner_size(LogicalSize::new(1280, 800));
+        let attrs = Window::default_attributes()
+            .with_title("sukeldu")
+            .with_inner_size(LogicalSize::new(1280, 800));
         let window = Arc::new(event_loop.create_window(attrs).expect("window"));
         self.gpu = Some(Gpu::new(window.clone(), LAYERS));
         self.window = Some(window);
@@ -351,14 +395,25 @@ impl ApplicationHandler for App {
                     }
                     PhysicalKey::Code(KeyCode::KeyH) => self.go_home(),
                     PhysicalKey::Code(KeyCode::KeyS) => self.samples = self.samples % 3 + 1,
-                    PhysicalKey::Code(KeyCode::KeyC) => println!("--at {:.17} {:.17} {:.6e}", self.view.cx, self.view.cy, self.view.upp),
+                    PhysicalKey::Code(KeyCode::KeyC) => println!(
+                        "--at {:.17} {:.17} {:.6e}",
+                        self.view.cx, self.view.cy, self.view.upp
+                    ),
                     PhysicalKey::Code(KeyCode::KeyF) => {
                         let win = self.window.as_ref().unwrap();
-                        let fs = if win.fullscreen().is_some() { None } else { Some(Fullscreen::Borderless(None)) };
+                        let fs = if win.fullscreen().is_some() {
+                            None
+                        } else {
+                            Some(Fullscreen::Borderless(None))
+                        };
                         win.set_fullscreen(fs);
                     }
-                    PhysicalKey::Code(KeyCode::BracketRight) => self.iter_mult = (self.iter_mult * 1.5).min(64.0),
-                    PhysicalKey::Code(KeyCode::BracketLeft) => self.iter_mult = (self.iter_mult / 1.5).max(0.25),
+                    PhysicalKey::Code(KeyCode::BracketRight) => {
+                        self.iter_mult = (self.iter_mult * 1.5).min(64.0)
+                    }
+                    PhysicalKey::Code(KeyCode::BracketLeft) => {
+                        self.iter_mult = (self.iter_mult / 1.5).max(0.25)
+                    }
                     _ => {}
                 }
             }

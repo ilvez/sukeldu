@@ -25,7 +25,11 @@ impl TileKey {
     }
 
     pub fn ancestor(&self, up: u32) -> TileKey {
-        TileKey { level: self.level - up, ix: self.ix >> up, iy: self.iy >> up }
+        TileKey {
+            level: self.level - up,
+            ix: self.ix >> up,
+            iy: self.iy >> up,
+        }
     }
 
     // NOTE: uv sub-rectangle of this tile inside its ancestor `up` levels above.
@@ -80,7 +84,11 @@ impl Cache {
             Some(l) => l,
             None => self.evict(frame)?,
         };
-        self.slots[layer as usize] = Some(Slot { key, last_used: frame, ready: false });
+        self.slots[layer as usize] = Some(Slot {
+            key,
+            last_used: frame,
+            ready: false,
+        });
         self.map.insert(key, layer);
         Some(layer)
     }
@@ -116,7 +124,11 @@ pub struct View {
 
 impl View {
     pub fn home() -> Self {
-        View { cx: -0.6, cy: 0.0, upp: 1.0 }
+        View {
+            cx: -0.6,
+            cy: 0.0,
+            upp: 1.0,
+        }
     }
 
     pub fn fit(&mut self, w: u32, h: u32) {
