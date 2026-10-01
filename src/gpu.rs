@@ -1,40 +1,33 @@
-use std::num::NonZeroU64;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use winit::window::Window;
 
 use crate::tiles::TILE;
 
-pub const MAX_DISPATCH: usize = 256;
 pub const MAX_INSTANCES: usize = 4096;
-const PARAMS_STRIDE: u64 = 256;
 const ORBIT_ENTRY_BYTES: u64 = 16;
-const BLA_ENTRY_BYTES: u64 = 48;
-const STATE_BYTES: u64 = 40;
+const SKIP_ENTRY_BYTES: u64 = 48;
+const STATE_BYTES: u64 = 64;
 pub const STATE_SLOTS: u32 = 12;
-pub const STEP_CAP: u32 = 512;
+pub const TILE_PIXELS: u32 = TILE * TILE;
 
-// NOTE: every dispatch advances a pixel by at least STEP_CAP iterations unless it finishes, so this many dispatches per slice always finish it.
-pub fn passes_for(max_iter: u32, samples: u32) -> u32 {
-    let total = max_iter as u64 * (samples * samples) as u64;
-    (total.div_ceil(STEP_CAP as u64) + 1) as u32
-}
-
+// NOTE: one entry per state slot, matching `Tile` in the iteration shaders; every dispatch covers all slots, and a shader skips the slots whose kernel is not its own (0 = idle slot).
 #[repr(C)]
-#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-struct Params {
-    origin: [f64; 2],
-    step: f64,
-    layer: u32,
-    max_iter: u32,
-    row0: u32,
-    samples: u32,
-    ref_len: u32,
-    bla_p: u32,
-    use_bla: u32,
-    slot: u32,
-    pass: u32,
-    _pad: u32,
+#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct TileParams {
+    pub origin: [f64; 2],
+    pub step: f64,
+    pub layer: u32,
+    pub max_iter: u32,
+    pub samples: u32,
+    pub ref_len: u32,
+    pub skip_p: u32,
+    pub use_skip: u32,
+    pub kernel: u32,
+    pub first: u32,
+    pub steps: u32,
+    pub _pad: u32,
 }
 
 #[repr(C)]
@@ -51,21 +44,11 @@ pub struct Globals {
 
 pub const TEXT_W: u32 = 768;
 pub const TEXT_H: u32 = crate::text::CELL_H as u32 * 2;
-pub const SLICE_ROWS: u32 = 32;
-
-pub struct Job {
-    pub layer: u32,
-    pub origin: [f64; 2],
-    pub step: f64,
-    pub max_iter: u32,
-    pub row0: u32,
-    pub samples: u32,
-    pub perturb: bool,
-    pub ref_len: u32,
-    pub bla_p: u32,
-    pub use_bla: bool,
-    pub slot: u32,
-    pub pass: u32,
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Kernel {
+    Direct = 1,
+    Perturb = 2,
+    Perturb32 = 3,
 }
 
 #[repr(C)]
@@ -84,12 +67,14 @@ pub struct Gpu {
     pub config: wgpu::SurfaceConfiguration,
     compute_pipeline: wgpu::ComputePipeline,
     perturb_pipeline: wgpu::ComputePipeline,
+    perturb32_pipeline: wgpu::ComputePipeline,
     compute_bgl: wgpu::BindGroupLayout,
     compute_bg: wgpu::BindGroup,
     params_buf: wgpu::Buffer,
-    orbit_buf: wgpu::Buffer,
-    bla_buf: wgpu::Buffer,
+    reference_bufs: [wgpu::Buffer; 4],
     state_buf: wgpu::Buffer,
+    done: DoneCounts,
+    submitted: u64,
     tile_tex: wgpu::Texture,
     tile_view: wgpu::TextureView,
     render_pipeline: wgpu::RenderPipeline,
@@ -102,7 +87,7 @@ pub struct Gpu {
 }
 
 impl Gpu {
-    pub fn new(window: Arc<Window>, layers: u32) -> Self {
+    pub fn new(window: Arc<Window>, layers: u32, vsync: bool) -> Self {
         let size = window.inner_size();
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
         let surface = instance.create_surface(window).expect("surface");
@@ -125,7 +110,16 @@ impl Gpu {
         let mut config = surface
             .get_default_config(&adapter, size.width.max(1), size.height.max(1))
             .expect("surface config");
-        config.present_mode = wgpu::PresentMode::Fifo;
+        let modes = surface.get_capabilities(&adapter).present_modes;
+        config.present_mode = if vsync {
+            wgpu::PresentMode::Fifo
+        } else {
+            [wgpu::PresentMode::Mailbox, wgpu::PresentMode::Immediate]
+                .into_iter()
+                .find(|m| modes.contains(m))
+                .unwrap_or(wgpu::PresentMode::Fifo)
+        };
+        config.usage |= wgpu::TextureUsages::COPY_SRC;
         surface.configure(&device, &config);
 
         let tile_tex = device.create_texture(&wgpu::TextureDescriptor {
@@ -151,28 +145,15 @@ impl Gpu {
 
         let params_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("params"),
-            size: PARAMS_STRIDE * MAX_DISPATCH as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            size: (std::mem::size_of::<TileParams>() * STATE_SLOTS as usize) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
 
-        let compute_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("compute"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/compute.wgsl").into()),
-        });
         let compute_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: None,
             entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: true,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
+                Self::read_only_storage(0),
                 wgpu::BindGroupLayoutEntry {
                     binding: 1,
                     visibility: wgpu::ShaderStages::COMPUTE,
@@ -213,49 +194,60 @@ impl Gpu {
                     },
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                Self::read_only_storage(6),
+                Self::read_only_storage(7),
             ],
         });
-        let orbit_buf = Self::create_storage_buffer(&device, "orbit", 2 * ORBIT_ENTRY_BYTES);
-        let bla_buf = Self::create_storage_buffer(&device, "bla", BLA_ENTRY_BYTES);
+        let reference_bufs = [
+            ("orbit", 2 * ORBIT_ENTRY_BYTES),
+            ("skip", SKIP_ENTRY_BYTES),
+            ("orbit32", ORBIT_ENTRY_BYTES),
+            ("skip32", SKIP_ENTRY_BYTES),
+        ]
+        .map(|(label, size)| Self::create_storage_buffer(&device, label, size));
         let state_size = STATE_SLOTS as u64 * (TILE * TILE) as u64 * STATE_BYTES;
         let state_buf = Self::create_storage_buffer(&device, "state", state_size);
+        let done = DoneCounts::new(&device);
         let compute_bg = Self::compute_bind_group(
             &device,
             &compute_bgl,
             &params_buf,
             &tile_view,
-            &orbit_buf,
-            &bla_buf,
-            &state_buf,
+            Self::storage_bindings(&reference_bufs, &state_buf, &done.counts),
         );
         let compute_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: None,
             bind_group_layouts: &[&compute_bgl],
             push_constant_ranges: &[],
         });
-        let compute_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("mandel"),
-            layout: Some(&compute_layout),
-            module: &compute_module,
-            entry_point: Some("main"),
-            compilation_options: Default::default(),
-            cache: None,
-        });
-        let perturb_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("perturb"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/perturb.wgsl").into()),
-        });
-        let perturb_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("mandel-perturb"),
-            layout: Some(&compute_layout),
-            module: &perturb_module,
-            entry_point: Some("main"),
-            compilation_options: wgpu::PipelineCompilationOptions {
-                constants: &[("STEP_CAP", STEP_CAP as f64)],
-                ..Default::default()
-            },
-            cache: None,
-        });
+        let iteration_pipeline = |label: &str, source: &str| {
+            let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some(label),
+                source: wgpu::ShaderSource::Wgsl(source.into()),
+            });
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some(label),
+                layout: Some(&compute_layout),
+                module: &module,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                cache: None,
+            })
+        };
+        let compute_pipeline = iteration_pipeline("direct", include_str!("shaders/compute.wgsl"));
+        let perturb_pipeline = iteration_pipeline("perturb", include_str!("shaders/perturb.wgsl"));
+        let perturb32_pipeline =
+            iteration_pipeline("perturb32", include_str!("shaders/perturb32.wgsl"));
 
         let render_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("render"),
@@ -448,12 +440,14 @@ impl Gpu {
             config,
             compute_pipeline,
             perturb_pipeline,
+            perturb32_pipeline,
             compute_bgl,
             compute_bg,
             params_buf,
-            orbit_buf,
-            bla_buf,
+            reference_bufs,
             state_buf,
+            done,
+            submitted: 0,
             tile_tex,
             tile_view,
             render_pipeline,
@@ -466,27 +460,63 @@ impl Gpu {
         }
     }
 
-    pub fn upload_reference(&mut self, orbit: &[[f64; 2]], bla: &[[f64; 6]]) {
-        let orbit_bytes: &[u8] = bytemuck::cast_slice(orbit);
-        let bla_bytes: &[u8] = bytemuck::cast_slice(bla);
-        let regrow = orbit_bytes.len() as u64 > self.orbit_buf.size()
-            || bla_bytes.len() as u64 > self.bla_buf.size();
-        if regrow {
-            let grown = |bytes: &[u8]| (bytes.len() as u64).next_power_of_two();
-            self.orbit_buf = Self::create_storage_buffer(&self.device, "orbit", grown(orbit_bytes));
-            self.bla_buf = Self::create_storage_buffer(&self.device, "bla", grown(bla_bytes));
+    pub fn upload_reference(&mut self, orbit: &[[f64; 2]], skip: &[[f64; 6]]) {
+        let orbit32: Vec<[f32; 2]> = orbit.iter().map(|z| z.map(|v| v as f32)).collect();
+        let skip32: Vec<[f32; 6]> = skip.iter().map(narrow_skip_entry).collect();
+        let data: [&[u8]; 4] = [
+            bytemuck::cast_slice(orbit),
+            bytemuck::cast_slice(skip),
+            bytemuck::cast_slice(&orbit32),
+            bytemuck::cast_slice(&skip32),
+        ];
+        let labels = ["orbit", "skip", "orbit32", "skip32"];
+        let mut regrown = false;
+        for ((buf, bytes), label) in self.reference_bufs.iter_mut().zip(data).zip(labels) {
+            if bytes.len() as u64 > buf.size() {
+                let size = (bytes.len() as u64).next_power_of_two();
+                *buf = Self::create_storage_buffer(&self.device, label, size);
+                regrown = true;
+            }
+        }
+        if regrown {
             self.compute_bg = Self::compute_bind_group(
                 &self.device,
                 &self.compute_bgl,
                 &self.params_buf,
                 &self.tile_view,
-                &self.orbit_buf,
-                &self.bla_buf,
-                &self.state_buf,
+                Self::storage_bindings(&self.reference_bufs, &self.state_buf, &self.done.counts),
             );
         }
-        self.queue.write_buffer(&self.orbit_buf, 0, orbit_bytes);
-        self.queue.write_buffer(&self.bla_buf, 0, bla_bytes);
+        for (buf, bytes) in self.reference_bufs.iter().zip(data) {
+            self.queue.write_buffer(buf, 0, bytes);
+        }
+    }
+
+    pub fn submitted(&self) -> u64 {
+        self.submitted
+    }
+
+    pub fn reset_done(&self, slot: u32) {
+        self.queue.write_buffer(
+            &self.done.counts,
+            (slot * 4) as u64,
+            bytemuck::bytes_of(&0u32),
+        );
+    }
+
+    // NOTE: per-slot counts of finished pixels, as of the returned submission; the copy is read asynchronously, so they trail the dispatches issued since.
+    pub fn poll_done(&mut self) -> Option<(u64, Vec<u32>)> {
+        let at = self.done.in_flight?;
+        let _ = self.device.poll(wgpu::PollType::Poll);
+        if !self.done.mapped.load(Ordering::Acquire) {
+            return None;
+        }
+        let counts =
+            bytemuck::cast_slice(&self.done.readback.slice(..).get_mapped_range()).to_vec();
+        self.done.readback.unmap();
+        self.done.mapped.store(false, Ordering::Release);
+        self.done.in_flight = None;
+        Some((at, counts))
     }
 
     pub fn write_text(&self, pixels: &[u8]) {
@@ -520,40 +550,31 @@ impl Gpu {
         self.surface.configure(&self.device, &self.config);
     }
 
-    pub fn frame(&mut self, jobs: &[Job], instances: &[Instance], globals: Globals) {
+    // NOTE: returns false when the frame was dropped (surface lost); its dispatches never ran, so the caller must not count them.
+    pub fn frame(
+        &mut self,
+        tiles: &[TileParams],
+        instances: &[Instance],
+        globals: Globals,
+        capture: Option<&str>,
+    ) -> bool {
         let output = match self.surface.get_current_texture() {
             Ok(o) => o,
             Err(wgpu::SurfaceError::Outdated) | Err(wgpu::SurfaceError::Lost) => {
                 self.surface.configure(&self.device, &self.config);
-                return;
+                return false;
             }
             Err(e) => {
                 eprintln!("surface error: {e:?}");
-                return;
+                return false;
             }
         };
         let view = output.texture.create_view(&Default::default());
 
-        for (i, job) in jobs.iter().enumerate() {
-            let p = Params {
-                origin: job.origin,
-                step: job.step,
-                layer: job.layer,
-                max_iter: job.max_iter,
-                row0: job.row0,
-                samples: job.samples,
-                ref_len: job.ref_len,
-                bla_p: job.bla_p,
-                use_bla: job.use_bla as u32,
-                slot: job.slot,
-                pass: job.pass,
-                _pad: 0,
-            };
-            self.queue.write_buffer(
-                &self.params_buf,
-                i as u64 * PARAMS_STRIDE,
-                bytemuck::bytes_of(&p),
-            );
+        let active = tiles.iter().any(|t| t.kernel != 0);
+        if active {
+            self.queue
+                .write_buffer(&self.params_buf, 0, bytemuck::cast_slice(tiles));
         }
         self.queue
             .write_buffer(&self.globals_buf, 0, bytemuck::bytes_of(&globals));
@@ -563,23 +584,21 @@ impl Gpu {
         }
 
         let mut encoder = self.device.create_command_encoder(&Default::default());
-        if !jobs.is_empty() {
+        if active {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: None,
                 timestamp_writes: None,
             });
-            let mut perturb_bound = None;
-            for (i, job) in jobs.iter().enumerate() {
-                if perturb_bound != Some(job.perturb) {
-                    pass.set_pipeline(if job.perturb {
-                        &self.perturb_pipeline
-                    } else {
-                        &self.compute_pipeline
-                    });
-                    perturb_bound = Some(job.perturb);
+            pass.set_bind_group(0, &self.compute_bg, &[]);
+            for (kernel, pipeline) in [
+                (Kernel::Direct, &self.compute_pipeline),
+                (Kernel::Perturb, &self.perturb_pipeline),
+                (Kernel::Perturb32, &self.perturb32_pipeline),
+            ] {
+                if tiles.iter().any(|t| t.kernel == kernel as u32) {
+                    pass.set_pipeline(pipeline);
+                    pass.dispatch_workgroups(TILE / 16, TILE / 16, tiles.len() as u32);
                 }
-                pass.set_bind_group(0, &self.compute_bg, &[(i as u64 * PARAMS_STRIDE) as u32]);
-                pass.dispatch_workgroups(TILE / 16, SLICE_ROWS / 16, 1);
             }
         }
         {
@@ -604,8 +623,98 @@ impl Gpu {
             pass.set_pipeline(&self.text_pipeline);
             pass.draw(0..4, 0..1);
         }
+        let capture = capture.map(|path| (path, self.copy_frame(&mut encoder, &output.texture)));
+        let read_done = active && self.done.in_flight.is_none();
+        if read_done {
+            encoder.copy_buffer_to_buffer(
+                &self.done.counts,
+                0,
+                &self.done.readback,
+                0,
+                self.done.counts.size(),
+            );
+        }
         self.queue.submit([encoder.finish()]);
+        self.submitted += 1;
+        if read_done {
+            self.done.in_flight = Some(self.submitted);
+            let mapped = self.done.mapped.clone();
+            self.done
+                .readback
+                .slice(..)
+                .map_async(wgpu::MapMode::Read, move |result| {
+                    mapped.store(result.is_ok(), Ordering::Release)
+                });
+        }
         output.present();
+        if let Some((path, buffer)) = capture {
+            self.write_ppm(path, &buffer);
+        }
+        true
+    }
+
+    fn copy_frame(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        frame: &wgpu::Texture,
+    ) -> wgpu::Buffer {
+        let (w, h) = (self.config.width, self.config.height);
+        let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("capture"),
+            size: (Self::padded_row(w) * h) as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        encoder.copy_texture_to_buffer(
+            frame.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(Self::padded_row(w)),
+                    rows_per_image: Some(h),
+                },
+            },
+            wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+        );
+        buffer
+    }
+
+    fn write_ppm(&self, path: &str, buffer: &wgpu::Buffer) {
+        let (w, h) = (self.config.width, self.config.height);
+        let slice = buffer.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        self.device.poll(wgpu::PollType::Wait).expect("poll");
+        let data = slice.get_mapped_range();
+        let bgr = matches!(
+            self.config.format,
+            wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb
+        );
+        let mut out = format!("P6\n{w} {h}\n255\n").into_bytes();
+        for row in data.chunks(Self::padded_row(w) as usize) {
+            for px in row[..(w * 4) as usize].chunks(4) {
+                let (r, g, b) = if bgr {
+                    (px[2], px[1], px[0])
+                } else {
+                    (px[0], px[1], px[2])
+                };
+                out.extend_from_slice(&[r, g, b]);
+            }
+        }
+        drop(data);
+        buffer.unmap();
+        if let Err(e) = std::fs::write(path, out) {
+            eprintln!("capture {path}: {e}");
+        }
+    }
+
+    fn padded_row(width: u32) -> u32 {
+        (width * 4).div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT)
+            * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT
     }
 
     pub fn read_layer(&self, layer: u32) -> Vec<f32> {
@@ -644,6 +753,28 @@ impl Gpu {
         data
     }
 
+    fn storage_bindings<'a>(
+        reference: &'a [wgpu::Buffer; 4],
+        state: &'a wgpu::Buffer,
+        done: &'a wgpu::Buffer,
+    ) -> [&'a wgpu::Buffer; 6] {
+        let [orbit, skip, orbit32, skip32] = reference;
+        [orbit, skip, state, done, orbit32, skip32]
+    }
+
+    fn read_only_storage(binding: u32) -> wgpu::BindGroupLayoutEntry {
+        wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        }
+    }
+
     fn create_storage_buffer(device: &wgpu::Device, label: &str, size: u64) -> wgpu::Buffer {
         device.create_buffer(&wgpu::BufferDescriptor {
             label: Some(label),
@@ -658,40 +789,73 @@ impl Gpu {
         layout: &wgpu::BindGroupLayout,
         params_buf: &wgpu::Buffer,
         tile_view: &wgpu::TextureView,
-        orbit_buf: &wgpu::Buffer,
-        bla_buf: &wgpu::Buffer,
-        state_buf: &wgpu::Buffer,
+        storage: [&wgpu::Buffer; 6],
     ) -> wgpu::BindGroup {
+        let mut entries = vec![
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: params_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(tile_view),
+            },
+        ];
+        entries.extend(
+            storage
+                .iter()
+                .zip(2..)
+                .map(|(buffer, binding)| wgpu::BindGroupEntry {
+                    binding,
+                    resource: buffer.as_entire_binding(),
+                }),
+        );
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
             layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                        buffer: params_buf,
-                        offset: 0,
-                        size: NonZeroU64::new(std::mem::size_of::<Params>() as u64),
-                    }),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(tile_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: orbit_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: bla_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: state_buf.as_entire_binding(),
-                },
-            ],
+            entries: &entries,
         })
+    }
+}
+
+// NOTE: skip coefficients grow like the orbit's derivative and can exceed the f32 range; such an entry gets radius 0, so the 32-bit shader never takes it and steps instead.
+fn narrow_skip_entry(e: &[f64; 6]) -> [f32; 6] {
+    let narrow = e.map(|v| v as f32);
+    if narrow.iter().all(|v| v.is_finite()) {
+        narrow
+    } else {
+        [0.0; 6]
+    }
+}
+
+struct DoneCounts {
+    counts: wgpu::Buffer,
+    readback: wgpu::Buffer,
+    mapped: Arc<AtomicBool>,
+    in_flight: Option<u64>,
+}
+
+impl DoneCounts {
+    fn new(device: &wgpu::Device) -> Self {
+        let size = (STATE_SLOTS * 4) as u64;
+        DoneCounts {
+            counts: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("done"),
+                size,
+                usage: wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_DST
+                    | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            }),
+            readback: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("done readback"),
+                size,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
+            mapped: Arc::new(AtomicBool::new(false)),
+            in_flight: None,
+        }
     }
 }
 
@@ -706,14 +870,17 @@ mod tests {
             .expect("wgsl validates");
     }
 
-    #[test]
-    fn direct_shader_is_valid() {
-        validate(include_str!("shaders/compute.wgsl"));
-    }
+    const SHADERS: [&str; 3] = [
+        include_str!("shaders/compute.wgsl"),
+        include_str!("shaders/perturb.wgsl"),
+        include_str!("shaders/perturb32.wgsl"),
+    ];
 
     #[test]
-    fn perturbation_shader_is_valid() {
-        validate(include_str!("shaders/perturb.wgsl"));
+    fn iteration_shaders_are_valid() {
+        for source in SHADERS {
+            validate(source);
+        }
     }
 
     fn struct_size(source: &str, name: &str) -> usize {
@@ -731,23 +898,31 @@ mod tests {
     }
 
     #[test]
-    fn perturbation_params_match_the_rust_layout() {
-        let source = include_str!("shaders/perturb.wgsl");
-        assert_eq!(
-            struct_size(source, "Params"),
-            std::mem::size_of::<super::Params>()
-        );
+    fn iteration_shaders_match_the_rust_tile_params_layout() {
+        for source in SHADERS {
+            assert_eq!(
+                struct_size(source, "Tile"),
+                std::mem::size_of::<super::TileParams>()
+            );
+        }
     }
 
     #[test]
     fn skip_table_entries_match_the_rust_layout() {
-        let source = include_str!("shaders/perturb.wgsl");
-        assert_eq!(struct_size(source, "Bla"), std::mem::size_of::<[f64; 6]>());
+        assert_eq!(
+            struct_size(SHADERS[1], "Skip"),
+            std::mem::size_of::<[f64; 6]>()
+        );
+        assert_eq!(
+            struct_size(SHADERS[2], "Skip"),
+            std::mem::size_of::<[f32; 6]>()
+        );
     }
 
     #[test]
-    fn pixel_state_matches_the_allocated_stride() {
-        let source = include_str!("shaders/perturb.wgsl");
-        assert_eq!(struct_size(source, "State") as u64, super::STATE_BYTES);
+    fn iteration_shaders_lay_out_pixel_state_with_the_allocated_stride() {
+        for source in SHADERS {
+            assert_eq!(struct_size(source, "State") as u64, super::STATE_BYTES);
+        }
     }
 }

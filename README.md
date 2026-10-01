@@ -38,7 +38,15 @@ AMD GPU under Linux. Rust + wgpu (Vulkan/RADV) + winit.
   `--at CX CY UPP` to stdout; `sukeldu --at CX CY UPP` starts there.
   `--perturb-from N` switches tiles at level N and deeper to perturbation
   (default 36; 0 renders everything but the root tile that way, for
-  comparing the two paths at one location).
+  comparing the two paths at one location). `--zoom-speed S` starts zooming
+  in at S levels per second, `--zoom-to UPP` stops that zoom at UPP, and
+  `--capture T1,T2 PREFIX` writes the frame at those seconds after start
+  (or on the frame the zoom stops, for `stop`, or on the first frame with no
+  tile work left, for `settled`) to `PREFIX_T.ppm`; together they make a
+  zoom run reproducible for `tools/preview_diff.py`. Test runs also use
+  `--app-id ID` (Wayland app id, for a compositor rule), `--no-vsync`
+  (hidden windows are throttled by the compositor) and `--trace` (one log
+  line per frame slower than 25 ms, with the work dispatched before it).
 
 ## Architecture
 
@@ -52,23 +60,34 @@ AMD GPU under Linux. Rust + wgpu (Vulkan/RADV) + winit.
   sub-rectangle of the coarser tile), so the screen is always fully covered
   and refinement only ever adds sharpness.
 - **Scheduling.** Missing tiles are computed coarse-to-fine, nearest to the
-  zoom focus first. Each tile is computed in 32-row slices spread over
-  frames, under a per-frame slice budget that adapts to the frame time so the
-  frame rate stays at the display refresh even when one tile costs more than a
-  frame. A tile is drawn only once all its slices are done. Perturbation tiles
-  are resumable: each dispatch advances every pixel by at most `STEP_CAP`
-  iterations and saves its state (delta, reference index, sample, running
-  sum) in a per-tile slot of a GPU buffer, so one dispatch is bounded no
-  matter the iteration limit. The CPU issues the worst-case number of
-  dispatches per slice (`passes_for`); pixels that finished earlier return
-  immediately. At most 12 perturbation tiles are in flight (one slot each).
-- **Shaders.** `src/shaders/compute.wgsl` iterates one tile directly in fp64
-  (shallow levels). `src/shaders/perturb.wgsl` iterates one tile as deltas
+  zoom focus first. While zooming in, tiles of the levels the zoom reaches
+  within the next 1.5 s are wanted too (where the view will be then), after
+  the current ones, and tiles whose nearest point leaves the screen within
+  half a second of zoom are skipped. Every tile is computed with the iteration cap of the view's
+  level (`2000 + 400 × level`, at most 200k), so magnified fallbacks show
+  the same black areas as the final tile. Up to 12 tiles are in flight, one
+  state slot each. Every frame, one dispatch per shader advances every
+  in-flight tile at once (256×256 pixels × 12 slots) by the same number of
+  iterations per pixel, and each pixel saves its state in its slot of a GPU
+  buffer, so a tile spreads over as many frames as it needs. The per-frame
+  budget is kept in pixel-iterations and adapts to the frame time; the step
+  count is that budget divided by the pixels still iterating, so newly
+  started tiles do not overload a frame. Each finished pixel increments its
+  slot's counter on the GPU; the counters are read back asynchronously, and
+  a tile is drawn once its counter reaches 65536.
+- **Shaders.** `src/shaders/compute.wgsl` iterates directly in fp64
+  (shallow levels), with the main cardioid / period-2 bulb test and a
+  periodicity check ending interior pixels early.
+  `src/shaders/perturb.wgsl` iterates as deltas
   against a reference orbit, with rebasing, so one reference is valid for
-  every pixel, and with bilinear skipping: `src/bla.rs` builds, next to each
+  every pixel, and with bilinear skipping: `src/skip.rs` builds, next to each
   orbit, a table where an entry at level k replaces 2^k steps by one linear
   step, valid while the delta is below the entry's radius. A tile may use it
   only if its farthest pixel is within 2^16 pixels of the reference.
+  `src/shaders/perturb32.wgsl` is the same in f32 (deltas, orbit and skip
+  table narrowed on upload), used for perturbation tiles up to level 100
+  (`--f32-until N` changes it, 0 turns it off); deeper tiles use the f64
+  shader.
   `src/shaders/render.wgsl` maps iteration counts to colours and
   draws the tile quads plus the text overlay.
 - **Reference orbits.** `src/reference.rs` computes one arbitrary-precision
@@ -98,8 +117,13 @@ Tiles from level 36 on are computed by perturbation with f64 deltas, up to
 level 900 (about 1e-273 units per pixel); deeper views magnify the level-900
 tiles. Perturbation has no interior shortcut yet, so interior pixels run to
 the iteration limit (bilinear skipping shortens them only while the orbit
-stays close to the reference). Direct tiles (below level 36) still run each
-slice in a single dispatch.
+stays close to the reference).
+
+## Experiments
+
+Ideas for keeping the preview during a zoom close to the final picture are
+tried one at a time and scored with `tools/preview_diff.py`; the log of what
+was tried, kept and rejected is `EXPERIMENTS.md`.
 
 ## Open work, in order
 
@@ -107,9 +131,10 @@ slice in a single dispatch.
    (`coredumpctl list sukeldu`) is in wgpu's OpenGL/EGL backend on Wayland,
    at `create_surface` or at exit in `dlclose`; rendering itself runs on
    Vulkan. Pass `backends: wgpu::Backends::VULKAN` in the `InstanceDescriptor`.
-2. **Quality standard before further tuning.** Fixed reference locations,
-   a frame-rate target while zooming, and a reference screenshot per location,
-   so every change is compared instead of judged by feel. Known references:
+2. **Quality standard before further tuning.** `tools/preview_diff.py` and
+   `EXPERIMENTS.md` cover the preview-versus-settled comparison at fixed
+   locations; a frame-rate target while zooming is still missing (capture
+   logs show 30 to 100 ms frames). Known references:
    - minibrot in dust: `--at -0.7394310682635371 -0.1268495465745192 4.263e-13`
    - spiral valley: `--at -0.7436438870371587 0.1318259042053119 2.0e-12`
    - a flat, bland region (pink screenshot at depth 10^12.7, level 45) and a
@@ -118,13 +143,13 @@ slice in a single dispatch.
 3. **Perturbation speed and range.** Exponent-extended deltas past level 900
    (removes the last depth limit), tuning of the dispatch size (`STEP_CAP`) and
    of the skip accuracy (`EPS` in
-   `src/bla.rs`) against reference screenshots, and an f32 inner loop where it
+   `src/skip.rs`) against reference screenshots, and an f32 inner loop where it
    matches the f64 images. Cheap deep and interior tiles are what pays for
    supersampling and higher iteration counts.
 4. **Iteration budget.** The per-level formula
-   (`150 + 100 × 1.12^level`) is a guess; near minibrots it leaves black
-   areas that should have detail. Needs an adaptive rule (e.g. raise while a
-   significant share of a tile's samples hit the cap).
+   (`2000 + 400 × level`, capped at 200k) is a guess; near minibrots it may
+   leave black areas that should have detail. Needs an adaptive rule (e.g.
+   raise while a significant share of a tile's samples hit the cap).
 5. **Supersampling cost.** 2×2 quadrupled tile cost and made refinement lag
    visibly before perturbation existed. Revisit the default (`S` cycles
    1/2/3) once tiles are cheap; consider averaging colours instead of counts.

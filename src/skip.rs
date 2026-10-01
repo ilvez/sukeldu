@@ -1,6 +1,6 @@
 const EPS: f64 = 1.0 / 16_777_216.0;
 
-// NOTE: entry layout is [a.x, a.y, b.x, b.y, radius, unused], matching `Bla` in perturb.wgsl. An entry at level k covers 2^k orbit steps: delta' = a * delta + b * dc, valid while |delta| < radius.
+// NOTE: entry layout is [a.x, a.y, b.x, b.y, radius, unused], matching `Skip` in perturb.wgsl. An entry at level k covers 2^k orbit steps: delta' = a * delta + b * dc, valid while |delta| < radius.
 pub struct Table {
     pub entries: Vec<[f64; 6]>,
     pub p: u32,

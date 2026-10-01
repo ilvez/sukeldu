@@ -3,7 +3,7 @@ use std::thread;
 
 use rug::{Assign, Float};
 
-use crate::bla::Table;
+use crate::skip::Table;
 use crate::tiles::{TileKey, View};
 
 pub const LEVEL_SPAN: u32 = 32;
@@ -12,15 +12,15 @@ pub const MAX_DISTANCE_PX: f64 = 1_073_741_824.0;
 
 const ORBIT_GUARD_BITS: u32 = 96;
 const BAILOUT: f64 = 65536.0;
-const BLA_DISTANCE_PX: f64 = 65536.0;
+const SKIP_DISTANCE_PX: f64 = 65536.0;
 
 pub struct Reference {
     cx: Float,
     cy: Float,
-    bla_dc: f64,
+    skip_dc: f64,
     pub level: u32,
     pub len: u32,
-    pub bla_p: u32,
+    pub skip_p: u32,
 }
 
 pub type Orbit = Vec<[f64; 2]>;
@@ -28,12 +28,12 @@ pub type Orbit = Vec<[f64; 2]>;
 pub struct Computed {
     pub reference: Reference,
     pub orbit: Orbit,
-    pub bla: Table,
+    pub skip: Table,
 }
 
 pub struct Located {
     pub offset: [f64; 2],
-    pub bla: bool,
+    pub skip: bool,
 }
 
 pub fn bits_for(level: u32) -> u32 {
@@ -44,20 +44,20 @@ pub fn spawn(cx: Float, cy: Float, level: u32, max_iter: u32) -> Receiver<Comput
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
         let orbit = compute_orbit(&cx, &cy, max_iter);
-        let bla_dc = BLA_DISTANCE_PX * (TileKey::world_size(level) / crate::tiles::TILE as f64);
-        let bla = Table::build(&orbit, bla_dc);
+        let skip_dc = SKIP_DISTANCE_PX * (TileKey::world_size(level) / crate::tiles::TILE as f64);
+        let skip = Table::build(&orbit, skip_dc);
         let reference = Reference {
             cx,
             cy,
-            bla_dc,
+            skip_dc,
             level,
             len: orbit.len() as u32,
-            bla_p: bla.p,
+            skip_p: skip.p,
         };
         let _ = tx.send(Computed {
             reference,
             orbit,
-            bla,
+            skip,
         });
     });
     rx
@@ -69,7 +69,7 @@ impl Reference {
         dx.hypot(dy)
     }
 
-    // NOTE: the skip table is only valid for deltas up to bla_dc, so a tile whose farthest pixel is beyond that must iterate step by step.
+    // NOTE: the skip table is only valid for deltas up to skip_dc, so a tile whose farthest pixel is beyond that must iterate step by step.
     pub fn locate(&self, key: &TileKey) -> Option<Located> {
         if key.level > self.level + LEVEL_SPAN {
             return None;
@@ -92,7 +92,7 @@ impl Reference {
             .hypot(oy.abs().max((oy + size).abs()));
         (distance <= MAX_DISTANCE_PX).then_some(Located {
             offset: [ox, oy],
-            bla: farthest <= self.bla_dc,
+            skip: farthest <= self.skip_dc,
         })
     }
 }
@@ -326,20 +326,6 @@ mod tests {
     }
 
     #[test]
-    fn the_production_pass_count_finishes_every_pixel() {
-        let orbit = orbit_of(-0.1, 0.0, 3000);
-        let table = Table::build(&orbit, 1e-5);
-        let samples = [(1e-7, 0.0), (-1e-7, 2e-7), (0.0, -3e-7), (2e-7, 2e-7)];
-
-        for table in [None, Some(&table)] {
-            let (results, dispatches) =
-                dispatches_until_done(&orbit, table, &samples, 3000, crate::gpu::STEP_CAP);
-            assert!(results.iter().all(|r| *r == Step::Interior));
-            assert!(dispatches <= crate::gpu::passes_for(3000, 2));
-        }
-    }
-
-    #[test]
     fn skip_table_allows_long_skips_near_a_boundary_point() {
         let orbit = orbit_of(0.0, 1.0, 500);
 
@@ -380,7 +366,7 @@ mod tests {
         let located = reference.locate(&key).unwrap();
         let size = TileKey::world_size(level);
         assert!(located.offset[0].abs() <= size && located.offset[1].abs() <= size);
-        assert!(located.bla);
+        assert!(located.skip);
 
         let deeper = TileKey {
             level: level + LEVEL_SPAN + 1,

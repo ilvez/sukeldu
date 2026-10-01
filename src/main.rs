@@ -1,6 +1,6 @@
-mod bla;
 mod gpu;
 mod reference;
+mod skip;
 mod text;
 mod tiles;
 
@@ -13,11 +13,10 @@ use winit::dpi::LogicalSize;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
+use winit::platform::wayland::WindowAttributesExtWayland;
 use winit::window::{Fullscreen, Window, WindowId};
 
-use gpu::{
-    Globals, Gpu, Instance, Job, MAX_DISPATCH, MAX_INSTANCES, SLICE_ROWS, STATE_SLOTS, passes_for,
-};
+use gpu::{Globals, Gpu, Instance, Kernel, MAX_INSTANCES, STATE_SLOTS, TILE_PIXELS, TileParams};
 use reference::{Computed, LEVEL_REFRESH_MARGIN, LEVEL_SPAN, Located, MAX_DISTANCE_PX, Reference};
 use tiles::{Cache, MAX_COMPUTE_LEVEL, TILE, TileKey, View};
 
@@ -25,29 +24,24 @@ const LAYERS: u32 = 1536;
 const FALLBACK_LEVELS: u32 = 4;
 const AUTOPILOT_PERIOD: u64 = 15;
 const DEFAULT_PERTURB_FROM_LEVEL: u32 = 36;
+// NOTE: pixel spacing at level 100 is 2^-106, far above f32's smallest normal (2^-126), so the 32-bit deltas keep their precision up to here.
+const DEFAULT_F32_UNTIL_LEVEL: u32 = 100;
 const FALLBACK_WALK: u32 = 12;
 const MAX_FALLBACK_UP: u32 = 60;
+const LEAD_SECONDS: f64 = 1.5;
+const LEAVE_SECONDS: f64 = 0.5;
+const SLOW_FRAME: f64 = 0.025;
+const MIN_STEPS: u32 = 16;
+const MAX_STEPS: u32 = 1 << 16;
+const MIN_WORK: f64 = (MIN_STEPS * TILE_PIXELS) as f64;
 
 struct Pending {
-    layer: u32,
     key: TileKey,
-    origin: [f64; 2],
-    step: f64,
-    max_iter: u32,
-    next_unit: u32,
-    passes: u32,
     slot: u32,
-    samples: u32,
-    perturb: bool,
-    ref_len: u32,
-    bla_p: u32,
-    use_bla: bool,
-}
-
-impl Pending {
-    fn total_units(&self) -> u32 {
-        TILE / SLICE_ROWS * self.passes
-    }
+    since: u64,
+    started: bool,
+    remaining: u32,
+    params: TileParams,
 }
 
 struct App {
@@ -56,13 +50,25 @@ struct App {
     cache: Cache,
     view: View,
     start: Option<View>,
+    app_id: String,
+    vsync: bool,
     home_log2_upp: f64,
     frame: u64,
     last: Instant,
-    budget: usize,
+    work: f64,
+    steps: u32,
     pending: Vec<Pending>,
     zoom_speed: f64,
-    cursor: (f64, f64),
+    start_zoom_speed: Option<f64>,
+    zoom_stop_log2_upp: Option<f64>,
+    captures: Vec<(When, String)>,
+    started: Instant,
+    zoom_stopped: bool,
+    slow_frames: u32,
+    trace: bool,
+    last_work: (usize, u32),
+    worst_frame: f64,
+    cursor: Option<(f64, f64)>,
     dragging: bool,
     autopilot: bool,
     target: Option<(TileKey, f64, f64)>,
@@ -70,33 +76,47 @@ struct App {
     samples: u32,
     text: String,
     perturb_from: u32,
+    f32_until: u32,
     reference: Option<Reference>,
     incoming: Option<Receiver<Computed>>,
     free_slots: Vec<u32>,
 }
 
 impl App {
-    fn new(start: Option<View>, perturb_from: u32) -> Self {
+    fn new(launch: Launch) -> Self {
         App {
             window: None,
             gpu: None,
             cache: Cache::new(LAYERS),
             view: View::home(),
-            start,
+            start: launch.view,
+            app_id: launch.app_id,
+            vsync: launch.vsync,
             home_log2_upp: 0.0,
             frame: 0,
             last: Instant::now(),
-            budget: 16,
+            work: MIN_WORK,
+            steps: MIN_STEPS,
             pending: Vec::new(),
             zoom_speed: 0.0,
-            cursor: (0.0, 0.0),
+            start_zoom_speed: launch.zoom_speed,
+            zoom_stop_log2_upp: launch.zoom_to_log2_upp,
+            captures: launch.captures,
+            started: Instant::now(),
+            zoom_stopped: false,
+            slow_frames: 0,
+            trace: launch.trace,
+            last_work: (0, 0),
+            worst_frame: 0.0,
+            cursor: None,
             dragging: false,
             autopilot: false,
             target: None,
             iter_mult: 1.0,
             samples: 2,
             text: String::new(),
-            perturb_from,
+            perturb_from: launch.perturb_from,
+            f32_until: launch.f32_until,
             reference: None,
             incoming: None,
             free_slots: (0..STATE_SLOTS).collect(),
@@ -124,8 +144,7 @@ impl App {
     }
 
     fn max_iter(&self, level: u32) -> u32 {
-        ((150.0 + 100.0 * 1.12f64.powi(level as i32)) * self.iter_mult).clamp(64.0, 200_000.0)
-            as u32
+        ((2000.0 + 400.0 * level as f64) * self.iter_mult).clamp(64.0, 200_000.0) as u32
     }
 
     fn go_home(&mut self) {
@@ -136,25 +155,45 @@ impl App {
         if let Some(v) = self.start.take() {
             self.view = v;
         }
-        self.zoom_speed = 0.0;
+        self.zoom_speed = self.start_zoom_speed.take().unwrap_or(0.0);
         self.target = None;
     }
 
     fn step_motion(&mut self, dt: f64) {
         let (w, h) = self.size();
-        let (mut fx, mut fy) = self.cursor;
+        let (mut fx, mut fy) = self.focus(w, h);
         if self.autopilot {
             if let Some((key, u, v)) = &self.target {
                 let k = (3.0 * dt).min(1.0);
                 let (dx, dy) = self.view.pixels_to(key, *u, *v);
                 self.view.add_pixels(dx * k, dy * k);
             }
-            fx = w as f64 / 2.0;
-            fy = h as f64 / 2.0;
+            (fx, fy) = (w as f64 / 2.0, h as f64 / 2.0);
         }
         if self.zoom_speed != 0.0 {
-            let factor = 2f64.powf(-self.zoom_speed * dt);
-            self.view.zoom_about(factor, fx, fy, w, h);
+            let mut step = -self.zoom_speed * dt;
+            let stop = self.zoom_stop_log2_upp.filter(|_| self.zoom_speed > 0.0);
+            if let Some(stop) = stop {
+                step = step.max(stop - self.view.log2_upp);
+            }
+            self.view.zoom_about(step.exp2(), fx, fy, w, h);
+            if stop.is_some_and(|stop| self.view.log2_upp <= stop) {
+                self.zoom_speed = 0.0;
+                self.zoom_stop_log2_upp = None;
+                self.zoom_stopped = true;
+            }
+        }
+    }
+
+    fn focus(&self, w: u32, h: u32) -> (f64, f64) {
+        self.cursor.unwrap_or((w as f64 / 2.0, h as f64 / 2.0))
+    }
+
+    fn lead_levels(&self) -> u32 {
+        if self.zoom_speed > 0.0 {
+            (self.zoom_speed * LEAD_SECONDS).ceil() as u32
+        } else {
+            0
         }
     }
 
@@ -180,39 +219,57 @@ impl App {
         }
     }
 
-    fn schedule(&mut self, level: u32, focus: (f64, f64), w: u32, h: u32) -> Vec<Job> {
+    fn schedule(&mut self, level: u32, focus: (f64, f64), w: u32, h: u32) -> Vec<TileParams> {
+        self.finish_tiles();
         let root = TileKey::root();
-        if !self.cache.contains(&root) {
+        if !self.cache.contains(&root) && !self.free_slots.is_empty() {
             let layer = self.cache.alloc(root.clone(), self.frame).unwrap();
             let (ox, oy) = root.origin();
-            self.pending.push(Pending {
-                layer,
-                key: root.clone(),
+            let params = TileParams {
                 origin: [ox, oy],
                 step: root.step(),
+                layer,
                 max_iter: self.max_iter(0),
-                next_unit: 0,
-                passes: 1,
-                slot: 0,
                 samples: self.samples,
-                perturb: false,
-                ref_len: 0,
-                bla_p: 0,
-                use_bla: false,
-            });
+                kernel: Kernel::Direct as u32,
+                ..Default::default()
+            };
+            self.start_tile(root.clone(), params);
         }
         self.cache.get(&root, self.frame);
 
-        // NOTE: tiles are computed in row slices across frames; keep a few tiles in flight so the slice budget is always usable.
-        if self.pending.len() < 4 {
+        if !self.free_slots.is_empty() {
             let mut wanted: Vec<(f64, TileKey, Option<Located>)> = Vec::new();
             let first = level.saturating_sub(FALLBACK_LEVELS);
-            for l in first..=level {
-                for key in self.view.visible_tiles(l, w, h) {
+            let last = (level + self.lead_levels()).min(MAX_COMPUTE_LEVEL);
+            // NOTE: zooming in scales every offset from the focus by 2^(speed * t); a tile whose nearest point is off screen after LEAVE_SECONDS is gone before it could land, so it is not worth computing.
+            let spread = (self.zoom_speed.max(0.0) * LEAVE_SECONDS).exp2();
+            let stays = |(x0, y0, x1, y1): (f64, f64, f64, f64)| {
+                let (nx, ny) = (focus.0.clamp(x0, x1), focus.1.clamp(y0, y1));
+                let (sx, sy) = (
+                    focus.0 + (nx - focus.0) * spread,
+                    focus.1 + (ny - focus.1) * spread,
+                );
+                (0.0..=w as f64).contains(&sx) && (0.0..=h as f64).contains(&sy)
+            };
+            for l in first..=last {
+                // NOTE: look-ahead levels are wanted where the zoom will be once it reaches them, not where the screen is now.
+                let mut view = self.view.clone();
+                if l > level {
+                    let factor = (-((l - level) as f64)).exp2();
+                    view.zoom_about(factor, focus.0, focus.1, w, h);
+                }
+                for key in view.visible_tiles(l, w, h) {
                     if self.cache.contains(&key) {
                         self.cache.get(&key, self.frame);
                         continue;
                     }
+                    let (x0, y0, x1, y1) = view.tile_rect(&key, w, h);
+                    if !stays((x0, y0, x1, y1)) {
+                        continue;
+                    }
+                    let (dx, dy) = ((x0 + x1) / 2.0 - focus.0, (y0 + y1) / 2.0 - focus.1);
+                    let d = (dx * dx + dy * dy).sqrt();
                     let located = if l >= self.perturb_from {
                         let Some(located) = self.reference.as_ref().and_then(|r| r.locate(&key))
                         else {
@@ -222,92 +279,89 @@ impl App {
                     } else {
                         None
                     };
-                    let (x0, y0, x1, y1) = self.view.tile_rect(&key, w, h);
-                    let (dx, dy) = ((x0 + x1) / 2.0 - focus.0, (y0 + y1) / 2.0 - focus.1);
-                    let d = (dx * dx + dy * dy).sqrt();
-                    wanted.push((d + (level - l) as f64 * -1e9, key, located));
+                    wanted.push((d + (l as f64 - level as f64) * 1e9, key, located));
                 }
             }
             wanted.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-            for (_, key, located) in wanted.into_iter().take(8) {
-                if located.is_some() && self.free_slots.is_empty() {
+            let free = self.free_slots.len();
+            for (_, key, located) in wanted.into_iter().take(free) {
+                let Some(layer) = self.cache.alloc(key.clone(), self.frame) else {
                     continue;
-                }
-                if let Some(layer) = self.cache.alloc(key.clone(), self.frame) {
-                    let max_iter = self.max_iter(key.level);
-                    let (origin, perturb, use_bla) = match located {
-                        Some(located) => (located.offset, true, located.bla),
-                        None => {
-                            let (ox, oy) = key.origin();
-                            ([ox, oy], false, false)
-                        }
-                    };
-                    let (slot, passes) = if perturb {
-                        (
-                            self.free_slots.pop().unwrap(),
-                            passes_for(max_iter, self.samples),
-                        )
-                    } else {
-                        (0, 1)
-                    };
-                    self.pending.push(Pending {
-                        layer,
-                        origin,
-                        step: key.step(),
-                        max_iter,
-                        next_unit: 0,
-                        passes,
-                        slot,
-                        samples: self.samples,
-                        perturb,
-                        ref_len: self.reference.as_ref().map_or(0, |r| r.len),
-                        bla_p: self.reference.as_ref().map_or(0, |r| r.bla_p),
-                        use_bla,
-                        key,
-                    });
-                }
+                };
+                let (origin, kernel, use_skip) = match located {
+                    Some(located) if key.level <= self.f32_until => {
+                        (located.offset, Kernel::Perturb32, located.skip)
+                    }
+                    Some(located) => (located.offset, Kernel::Perturb, located.skip),
+                    None => {
+                        let (ox, oy) = key.origin();
+                        ([ox, oy], Kernel::Direct, false)
+                    }
+                };
+                let params = TileParams {
+                    origin,
+                    step: key.step(),
+                    layer,
+                    max_iter: self.max_iter(key.level.max(level)),
+                    samples: self.samples,
+                    ref_len: self.reference.as_ref().map_or(0, |r| r.len),
+                    skip_p: self.reference.as_ref().map_or(0, |r| r.skip_p),
+                    use_skip: use_skip as u32,
+                    kernel: kernel as u32,
+                    ..Default::default()
+                };
+                self.start_tile(key, params);
             }
         }
 
-        let mut jobs = Vec::new();
-        let mut slices = self.budget.min(MAX_DISPATCH);
-        for p in self.pending.iter_mut() {
-            while slices > 0 && p.next_unit < p.total_units() {
-                jobs.push(Job {
-                    layer: p.layer,
-                    origin: p.origin,
-                    step: p.step,
-                    max_iter: p.max_iter,
-                    row0: p.next_unit / p.passes * SLICE_ROWS,
-                    samples: p.samples,
-                    perturb: p.perturb,
-                    ref_len: p.ref_len,
-                    bla_p: p.bla_p,
-                    use_bla: p.use_bla,
-                    slot: p.slot,
-                    pass: p.next_unit % p.passes,
-                });
-                p.next_unit += 1;
-                slices -= 1;
-            }
-            if slices == 0 {
-                break;
-            }
+        // NOTE: the cost of a dispatch is roughly steps × pixels still iterating, so the per-frame budget is kept in pixel-steps; fresh tiles then lower the step count at once instead of overloading the frame that starts them.
+        let running: u64 = self.pending.iter().map(|p| p.remaining as u64).sum();
+        self.steps =
+            (self.work / running.max(1) as f64).clamp(MIN_STEPS as f64, MAX_STEPS as f64) as u32;
+        let mut tiles = vec![TileParams::default(); STATE_SLOTS as usize];
+        for p in &self.pending {
+            tiles[p.slot as usize] = TileParams {
+                first: !p.started as u32,
+                steps: self.steps,
+                ..p.params
+            };
         }
+        tiles
+    }
+
+    fn start_tile(&mut self, key: TileKey, params: TileParams) {
+        let slot = self.free_slots.pop().unwrap();
+        let gpu = self.gpu.as_ref().unwrap();
+        gpu.reset_done(slot);
+        self.pending.push(Pending {
+            key,
+            slot,
+            since: gpu.submitted() + 1,
+            started: false,
+            remaining: TILE_PIXELS,
+            params,
+        });
+    }
+
+    // NOTE: a tile is done when the GPU counted every one of its pixels finished; the counts are read back asynchronously, so a tile is seen done a few frames after its last pixel, and counts read before the slot was claimed (since) are ignored.
+    fn finish_tiles(&mut self) {
+        let Some((at, counts)) = self.gpu.as_mut().unwrap().poll_done() else {
+            return;
+        };
         let frame = self.frame;
         let cache = &mut self.cache;
         let free_slots = &mut self.free_slots;
-        self.pending.retain(|p| {
-            if p.next_unit < p.total_units() {
+        self.pending.retain_mut(|p| {
+            if p.since > at {
                 return true;
             }
-            cache.mark_ready(p.layer, frame);
-            if p.perturb {
+            p.remaining = TILE_PIXELS - counts[p.slot as usize];
+            if p.remaining == 0 {
+                cache.mark_ready(p.params.layer, frame);
                 free_slots.push(p.slot);
             }
-            false
+            p.remaining != 0
         });
-        jobs
     }
 
     fn render_frame(&mut self) {
@@ -318,9 +372,22 @@ impl App {
         let (w, h) = self.size();
 
         self.step_motion(dt);
+        if dt > SLOW_FRAME {
+            self.slow_frames += 1;
+            if self.trace {
+                let (tiles, steps) = self.last_work;
+                println!(
+                    "slow frame {:.0}ms at {:.2}s: previous frame advanced {tiles} tiles by {steps} steps, level {}",
+                    dt * 1000.0,
+                    self.started.elapsed().as_secs_f64(),
+                    self.view.target_level()
+                );
+            }
+        }
+        self.worst_frame = self.worst_frame.max(dt);
 
         let level = self.view.target_level().min(MAX_COMPUTE_LEVEL);
-        self.update_reference(level);
+        self.update_reference((level + self.lead_levels()).min(MAX_COMPUTE_LEVEL));
         if self.autopilot && self.frame % AUTOPILOT_PERIOD == 0 {
             if let Some((key, layer)) = self.centre_tile_layer(level) {
                 let data = self.gpu.as_ref().unwrap().read_layer(layer);
@@ -331,9 +398,10 @@ impl App {
         let focus = if self.autopilot {
             (w as f64 / 2.0, h as f64 / 2.0)
         } else {
-            self.cursor
+            self.focus(w, h)
         };
-        let jobs = self.schedule(level, focus, w, h);
+        let tiles = self.schedule(level, focus, w, h);
+        self.last_work = (self.pending.len(), self.steps);
 
         let mut instances: Vec<Instance> = Vec::new();
         let first_up = level.saturating_sub(self.cache.max_ready_level());
@@ -342,7 +410,12 @@ impl App {
             let frame = self.frame;
             let cache = &mut self.cache;
             let found = (first_up..=last_up)
-                .find_map(|up| cache.get(&key.ancestor(up), frame).map(|layer| (layer, up)));
+                .find_map(|up| cache.get(&key.ancestor(up), frame).map(|layer| (layer, up)))
+                .or_else(|| {
+                    cache
+                        .get(&key.ancestor(key.level), frame)
+                        .map(|layer| (layer, key.level))
+                });
             let Some((layer, up)) = found else {
                 continue;
             };
@@ -373,11 +446,11 @@ impl App {
         let text_changed = text != self.text;
         self.text = text;
 
-        // NOTE: the frame time includes the vsync wait, so it only signals overload once the budget pushes past one refresh interval.
+        // NOTE: the frame time includes the vsync wait, so it only signals overload once the work budget pushes past one refresh interval.
         if dt > 0.018 {
-            self.budget = (self.budget / 2).max(1);
+            self.work = (self.work / 2.0).max(MIN_WORK);
         } else if dt < 0.0169 {
-            self.budget = (self.budget + 2).min(MAX_DISPATCH);
+            self.work *= 1.0625;
         }
 
         let globals = Globals {
@@ -389,6 +462,14 @@ impl App {
             stripe: 0.2,
             _pad: [0.0; 2],
         };
+        let elapsed = self.started.elapsed().as_secs_f64();
+        let settled = self.is_settled();
+        let due = self.captures.iter().position(|(when, _)| match when {
+            When::At(at) => elapsed >= *at,
+            When::ZoomStop => self.zoom_stopped,
+            When::Settled => settled,
+        });
+        let capture = due.map(|i| self.captures.remove(i).1);
         let gpu = self.gpu.as_mut().unwrap();
         if text_changed {
             gpu.write_text(&text::rasterize(
@@ -397,7 +478,19 @@ impl App {
                 gpu::TEXT_H as usize,
             ));
         }
-        gpu.frame(&jobs, &instances, globals);
+        if gpu.frame(&tiles, &instances, globals, capture.as_deref()) {
+            for p in &mut self.pending {
+                p.started = true;
+            }
+        }
+        if let Some(path) = capture {
+            println!(
+                "capture {path}: {elapsed:.2}s, level {level}, slow frames {} of {}, worst {:.0}ms",
+                self.slow_frames,
+                self.frame,
+                self.worst_frame * 1000.0
+            );
+        }
     }
 
     fn update_reference(&mut self, level: u32) {
@@ -421,22 +514,31 @@ impl App {
         let Computed {
             reference,
             orbit,
-            bla,
+            skip,
         } = computed;
         self.gpu
             .as_mut()
             .unwrap()
-            .upload_reference(&orbit, &bla.entries);
+            .upload_reference(&orbit, &skip.entries);
         let cache = &mut self.cache;
         let free_slots = &mut self.free_slots;
         self.pending.retain(|p| {
-            if p.perturb {
+            let direct = p.params.kernel == Kernel::Direct as u32;
+            if !direct {
                 cache.cancel(&p.key);
                 free_slots.push(p.slot);
             }
-            !p.perturb
+            direct
         });
         self.reference = Some(reference);
+    }
+
+    // NOTE: schedule() refills the pending list whenever a visible tile is missing, so an empty list after it ran means nothing is left to compute, unless a reference orbit is still on its way.
+    fn is_settled(&self) -> bool {
+        self.zoom_speed == 0.0
+            && self.start_zoom_speed.is_none()
+            && self.pending.is_empty()
+            && self.incoming.is_none()
     }
 
     fn reference_is_stale(&self, level: u32) -> bool {
@@ -457,12 +559,14 @@ impl ApplicationHandler for App {
         }
         let attrs = Window::default_attributes()
             .with_title("sukeldu")
+            .with_name(self.app_id.as_str(), "")
             .with_inner_size(LogicalSize::new(1280, 800));
         let window = Arc::new(event_loop.create_window(attrs).expect("window"));
-        self.gpu = Some(Gpu::new(window.clone(), LAYERS));
+        self.gpu = Some(Gpu::new(window.clone(), LAYERS, self.vsync));
         self.window = Some(window);
         self.go_home();
         self.last = Instant::now();
+        self.started = self.last;
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
@@ -475,12 +579,10 @@ impl ApplicationHandler for App {
             }
             WindowEvent::RedrawRequested => self.render_frame(),
             WindowEvent::CursorMoved { position, .. } => {
-                if self.dragging {
-                    let dx = position.x - self.cursor.0;
-                    let dy = position.y - self.cursor.1;
-                    self.view.add_pixels(-dx, -dy);
+                if let (true, Some((ox, oy))) = (self.dragging, self.cursor) {
+                    self.view.add_pixels(ox - position.x, oy - position.y);
                 }
-                self.cursor = (position.x, position.y);
+                self.cursor = Some((position.x, position.y));
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 let lines = match delta {
@@ -544,23 +646,73 @@ impl ApplicationHandler for App {
     }
 }
 
-fn parse_args() -> Option<View> {
-    let args: Vec<String> = std::env::args().collect();
-    let i = args.iter().position(|a| a == "--at")?;
-    View::at(args.get(i + 1)?, args.get(i + 2)?, args.get(i + 3)?)
+enum When {
+    At(f64),
+    ZoomStop,
+    Settled,
 }
 
-fn parse_perturb_from() -> u32 {
+struct Launch {
+    view: Option<View>,
+    perturb_from: u32,
+    f32_until: u32,
+    zoom_speed: Option<f64>,
+    zoom_to_log2_upp: Option<f64>,
+    captures: Vec<(When, String)>,
+    app_id: String,
+    vsync: bool,
+    trace: bool,
+}
+
+fn parse_launch() -> Launch {
     let args: Vec<String> = std::env::args().collect();
-    args.iter()
-        .position(|a| a == "--perturb-from")
-        .and_then(|i| args.get(i + 1)?.parse().ok())
-        .unwrap_or(DEFAULT_PERTURB_FROM_LEVEL)
+    let after = |flag: &str| {
+        let i = args.iter().position(|a| a == flag)?;
+        args.get(i + 1)
+    };
+    let parse = |flag: &str| after(flag)?.parse::<f64>().ok();
+    let view = args
+        .iter()
+        .position(|a| a == "--at")
+        .and_then(|i| View::at(args.get(i + 1)?, args.get(i + 2)?, args.get(i + 3)?));
+    let captures = args
+        .iter()
+        .position(|a| a == "--capture")
+        .and_then(|i| {
+            let prefix = args.get(i + 2)?;
+            let time = |t: &str| match t {
+                "stop" => Some(When::ZoomStop),
+                "settled" => Some(When::Settled),
+                _ => t.parse().ok().map(When::At),
+            };
+            Some(
+                args.get(i + 1)?
+                    .split(',')
+                    .filter_map(|t| Some((time(t)?, format!("{prefix}_{t}.ppm"))))
+                    .collect(),
+            )
+        })
+        .unwrap_or_default();
+    Launch {
+        view,
+        perturb_from: after("--perturb-from")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(DEFAULT_PERTURB_FROM_LEVEL),
+        f32_until: after("--f32-until")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(DEFAULT_F32_UNTIL_LEVEL),
+        zoom_speed: parse("--zoom-speed"),
+        zoom_to_log2_upp: parse("--zoom-to").map(f64::log2),
+        captures,
+        app_id: after("--app-id").map_or("sukeldu".to_string(), String::clone),
+        vsync: !args.iter().any(|a| a == "--no-vsync"),
+        trace: args.iter().any(|a| a == "--trace"),
+    }
 }
 
 fn main() {
     let event_loop = EventLoop::new().expect("event loop");
     event_loop.set_control_flow(ControlFlow::Poll);
-    let mut app = App::new(parse_args(), parse_perturb_from());
+    let mut app = App::new(parse_launch());
     event_loop.run_app(&mut app).expect("run");
 }

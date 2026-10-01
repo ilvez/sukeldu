@@ -14,40 +14,39 @@ struct Tile {
 }
 
 struct Skip {
-    a: vec2<f64>,
-    b: vec2<f64>,
-    radius: f64,
-    unused: f64,
+    a: vec2<f32>,
+    b: vec2<f32>,
+    radius: f32,
+    unused: f32,
 }
 
 struct State {
-    dx: f64,
-    dy: f64,
+    dx: f32,
+    dy: f32,
     sum: f32,
     inside: u32,
     m: u32,
     n: u32,
     sample: u32,
-    unused: array<u32, 7>,
+    unused: array<u32, 9>,
 }
 
 @group(0) @binding(0) var<storage, read> tiles: array<Tile>;
 @group(0) @binding(1) var out_tex: texture_storage_2d_array<r32float, write>;
-@group(0) @binding(2) var<storage, read> orbit: array<vec2<f64>>;
-@group(0) @binding(3) var<storage, read> skip: array<Skip>;
 @group(0) @binding(4) var<storage, read_write> state: array<State>;
 @group(0) @binding(5) var<storage, read_write> done: array<atomic<u32>>;
+@group(0) @binding(6) var<storage, read> orbit: array<vec2<f32>>;
+@group(0) @binding(7) var<storage, read> skip: array<Skip>;
 
 var<private> p: Tile;
 
-const KERNEL: u32 = 2u;
+const KERNEL: u32 = 3u;
 const TILE: u32 = 256u;
 const UNFINISHED: f32 = -2.0;
 
-// Returns the smooth count once the sample escapes, -1 when it reaches max_iter, UNFINISHED when the per-dispatch budget ran out first.
-fn advance(dcx: f64, dcy: f64, st: ptr<function, State>, spent: ptr<function, u32>) -> f32 {
-    let two = f64(2.0);
-    let bail = f64(65536.0);
+// NOTE: perturb.wgsl in 32-bit floats. Deltas only need relative precision, so f32 holds them while they stay above its normal range (about 1e-38); the CPU picks this shader only for levels where the pixel spacing is far above that.
+fn advance(dcx: f32, dcy: f32, st: ptr<function, State>, spent: ptr<function, u32>) -> f32 {
+    let bail = 65536.0;
     let last = p.ref_len - 1u;
     let top = 31u - countLeadingZeros(p.skip_p);
     var dx = (*st).dx;
@@ -63,10 +62,9 @@ fn advance(dcx: f64, dcy: f64, st: ptr<function, State>, spent: ptr<function, u3
         if (*spent >= p.steps) {
             break;
         }
-        var ndx = f64(0.0);
-        var ndy = f64(0.0);
+        var ndx = 0.0;
+        var ndy = 0.0;
         var len: u32 = 0u;
-        // NOTE: bilinear skip. An entry at level k replaces 2^k steps by delta' = a * delta + b * dc, valid while |delta| is below its radius; the longest valid one starting at orbit index m is taken (only indices divisible by 2^k start a level-k entry).
         if (p.use_skip != 0u) {
             let dmag = dx * dx + dy * dy;
             var k = min(countTrailingZeros(m), top);
@@ -89,8 +87,8 @@ fn advance(dcx: f64, dcy: f64, st: ptr<function, State>, spent: ptr<function, u3
         }
         if (len == 0u) {
             let z = orbit[m];
-            ndx = two * (z.x * dx - z.y * dy) + dx * dx - dy * dy + dcx;
-            ndy = two * (z.x * dy + z.y * dx) + two * dx * dy + dcy;
+            ndx = 2.0 * (z.x * dx - z.y * dy) + dx * dx - dy * dy + dcx;
+            ndy = 2.0 * (z.x * dy + z.y * dx) + 2.0 * dx * dy + dcy;
             len = 1u;
         }
         m = m + len;
@@ -101,11 +99,9 @@ fn advance(dcx: f64, dcy: f64, st: ptr<function, State>, spent: ptr<function, u3
         let fy = r.y + ndy;
         let mag = fx * fx + fy * fy;
         if (mag > bail) {
-            // NOTE: smooth iteration count for bailout radius 256, same formula as compute.wgsl.
-            result = f32(n) + 3.0 - log2(0.5 * log2(f32(mag)));
+            result = f32(n) + 3.0 - log2(0.5 * log2(mag));
             break;
         }
-        // NOTE: rebasing. When the full orbit value is smaller than the delta, or the reference orbit ends, continue with the full value against the start of the reference; this is what makes one reference valid for every pixel.
         if (mag < ndx * ndx + ndy * ndy || m == last) {
             dx = fx;
             dy = fy;
@@ -134,7 +130,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let s = max(p.samples, 1u);
     let total = s * s;
     let idx = slot * TILE * TILE + py * TILE + px;
-    var st = State(f64(0.0), f64(0.0), 0.0, 0u, 0u, 0u, 0u, array<u32, 7>());
+    var st = State(0.0, 0.0, 0.0, 0u, 0u, 0u, 0u, array<u32, 9>());
     if (p.first == 0u) {
         st = state[idx];
     }
@@ -149,8 +145,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
         let i = st.sample % s;
         let j = st.sample / s;
-        let dcx = p.origin.x + f64(px) * p.step + (f64(i) + f64(0.5)) * sub;
-        let dcy = p.origin.y + f64(py) * p.step + (f64(j) + f64(0.5)) * sub;
+        let dcx = f32(p.origin.x + f64(px) * p.step + (f64(i) + f64(0.5)) * sub);
+        let dcy = f32(p.origin.y + f64(py) * p.step + (f64(j) + f64(0.5)) * sub);
         let v = advance(dcx, dcy, &st, &spent);
         if (v == UNFINISHED) {
             break;
@@ -160,15 +156,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         } else {
             st.sum = st.sum + v;
         }
-        st.dx = f64(0.0);
-        st.dy = f64(0.0);
+        st.dx = 0.0;
+        st.dy = 0.0;
         st.m = 0u;
         st.n = 0u;
         st.sample = st.sample + 1u;
     }
     state[idx] = st;
     if (st.sample >= total) {
-        // NOTE: a texel is stored as interior only when every sample is; otherwise the escaped samples' mean keeps boundary pixels coloured.
         var v: f32 = -1.0;
         let escaped = total - st.inside;
         if (escaped > 0u) {
