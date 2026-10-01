@@ -78,6 +78,12 @@ the zoom stops exactly on the target, so runs end on identical views.
 | batched dispatch, adaptive steps | 44.7 / 0.53, 30 of 315, 100 ms, 31 s | 1.8 / 0.00, 33 of 440, 61 ms, 4 s | 38.7 / 0.53, 36 of 353, 100 ms, 56 s | 8.8 / 0.02, 28 of 386, 72 ms, 10 s |
 | batched, budget in pixel-steps | 43.2 / 0.52, 16 of 667, 31 ms, 29 s | 1.6 / 0.00, 14 of 585, 41 ms, 4 s | 38.7 / 0.53, 10 of 643, 34 ms, 54 s | 8.5 / 0.02, 15 of 625, 43 ms, 10 s |
 | same, 32-bit perturbation | 43.2 / 0.52, 8 of 632, 35 ms, 15 s | 1.6 / 0.00, 7 of 612, 37 ms, 4 s | 26.8 / 0.34, 9 of 652, 35 ms, 20 s | 3.8 / 0.01, 7 of 627, 29 ms, 5 s |
+| budget fix: whole-tile costing, no growth on idle frames | 45.8 / 0.54, 18 of 491, 100 ms, 15 s | 1.4 / 0.00, 5 of 612, 36 ms, 4 s | 26.8 / 0.34, 16 of 532, 54 ms, 21 s | 3.4 / 0.00, 9 of 616, 37 ms, 5 s |
+| + at most 1024 steps per pixel per frame | 42.0 / 0.51, 18 of 603, 39 ms, 15 s | 1.6 / 0.00, 5 of 528, 35 ms, 4 s | 27.1 / 0.34, 4 of 593, 31 ms, 21 s | 3.5 / 0.01, 0 of 583, 24 ms, 5 s |
+
+The frame on which the preview is captured is itself slow (about 100 ms:
+the capture waits for the GPU and writes the file), so the worst frame of
+a whole run is not counted past the preview capture.
 
 ### Static views, settled pictures compared between builds
 
@@ -161,7 +167,9 @@ Nothing is committed yet.
 | 32-bit perturbation deltas, orbit and skip table (`perturb32.wgsl`) | kept, default up to level 100 | 1.3 times faster on per-slice dispatch, 2 to 2.6 times on batched dispatch; pictures match except colour noise in dust. Verified at levels 36 to 44. |
 | One dispatch per shader per frame over all in-flight tiles | kept | 3 to 4 times faster settling, bit-identical pictures. |
 | Per-frame step count adapted to frame time | superseded | 100 ms spikes when fresh tiles started. |
-| Per-frame budget in pixel-steps | kept | Slow frames 10 to 16 per 600, worst 31 to 43 ms. |
+| Per-frame budget in pixel-steps, costed by pixels still iterating | superseded | Slow frames 10 to 16 per 600, worst 31 to 43 ms, but it hung the GPU on a laptop (Radeon 780M, "context is guilty of a hard recovery"): the budget grew on idle frames without limit, and scattered unfinished pixels were costed as nearly free. |
+| Per-frame budget in pixel-steps, costed by whole in-flight tiles, adjusted only on frames that dispatched work | kept | Same throughput; still a 100 ms frame when the budget grown on cheap tiles met dense ones. |
+| At most 1024 steps per pixel per frame | kept | Bounds the worst dispatch on any GPU; worst zoom frame 24 to 39 ms, same settle times. Not yet re-tested on the laptop. |
 | Interior test in the perturbation shader | not tried | Needed before perturbation can replace the direct path. |
 | More tiles in flight (more state slots) | not tried | |
 | Paint cap-hit pixels with the cap count's colour instead of black; black only for proven interior | not tried | Needs a decision on how minibrots look in the perturbation regime. |

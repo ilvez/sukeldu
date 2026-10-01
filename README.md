@@ -70,9 +70,11 @@ AMD GPU under Linux. Rust + wgpu (Vulkan/RADV) + winit.
   in-flight tile at once (256×256 pixels × 12 slots) by the same number of
   iterations per pixel, and each pixel saves its state in its slot of a GPU
   buffer, so a tile spreads over as many frames as it needs. The per-frame
-  budget is kept in pixel-iterations and adapts to the frame time; the step
-  count is that budget divided by the pixels still iterating, so newly
-  started tiles do not overload a frame. Each finished pixel increments its
+  budget is kept in pixel-iterations and adapts to the frame time of frames
+  that computed tiles; the step count is that budget divided by the pixels
+  of all in-flight tiles, at most 1024, so newly started tiles do not
+  overload a frame and no dispatch can run long enough to trip the GPU
+  driver's hang timeout. Each finished pixel increments its
   slot's counter on the GPU; the counters are read back asynchronously, and
   a tile is drawn once its counter reaches 65536.
 - **Shaders.** `src/shaders/compute.wgsl` iterates directly in fp64

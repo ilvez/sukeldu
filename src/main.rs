@@ -32,7 +32,8 @@ const LEAD_SECONDS: f64 = 1.5;
 const LEAVE_SECONDS: f64 = 0.5;
 const SLOW_FRAME: f64 = 0.025;
 const MIN_STEPS: u32 = 16;
-const MAX_STEPS: u32 = 1 << 16;
+// NOTE: the cost of a step varies tenfold between tiles (pixels that escape early leave their threads idle), so the adaptive budget can grow on cheap tiles and then overload a frame on dense ones. This cap bounds the worst dispatch to 12 × 65536 × 1024 thread-steps, about 30 ms on an RX 6700 XT and far below the GPU driver's hang timeout on an integrated Radeon 780M.
+const MAX_STEPS: u32 = 1 << 10;
 const MIN_WORK: f64 = (MIN_STEPS * TILE_PIXELS) as f64;
 
 struct Pending {
@@ -40,7 +41,6 @@ struct Pending {
     slot: u32,
     since: u64,
     started: bool,
-    remaining: u32,
     params: TileParams,
 }
 
@@ -314,10 +314,10 @@ impl App {
             }
         }
 
-        // NOTE: the cost of a dispatch is roughly steps × pixels still iterating, so the per-frame budget is kept in pixel-steps; fresh tiles then lower the step count at once instead of overloading the frame that starts them.
-        let running: u64 = self.pending.iter().map(|p| p.remaining as u64).sum();
+        // NOTE: the per-frame budget is kept in pixel-steps and every in-flight tile is costed at its full size: GPU threads run in groups that last as long as their slowest pixel, so a tile with a few scattered unfinished pixels costs nearly as much as a fresh one. Fresh tiles then lower the step count at once instead of overloading the frame that starts them.
+        let running = self.pending.len() as f64 * TILE_PIXELS as f64;
         self.steps =
-            (self.work / running.max(1) as f64).clamp(MIN_STEPS as f64, MAX_STEPS as f64) as u32;
+            (self.work / running.max(1.0)).clamp(MIN_STEPS as f64, MAX_STEPS as f64) as u32;
         let mut tiles = vec![TileParams::default(); STATE_SLOTS as usize];
         for p in &self.pending {
             tiles[p.slot as usize] = TileParams {
@@ -338,7 +338,6 @@ impl App {
             slot,
             since: gpu.submitted() + 1,
             started: false,
-            remaining: TILE_PIXELS,
             params,
         });
     }
@@ -351,16 +350,13 @@ impl App {
         let frame = self.frame;
         let cache = &mut self.cache;
         let free_slots = &mut self.free_slots;
-        self.pending.retain_mut(|p| {
-            if p.since > at {
-                return true;
-            }
-            p.remaining = TILE_PIXELS - counts[p.slot as usize];
-            if p.remaining == 0 {
+        self.pending.retain(|p| {
+            let done = p.since <= at && counts[p.slot as usize] == TILE_PIXELS;
+            if done {
                 cache.mark_ready(p.params.layer, frame);
                 free_slots.push(p.slot);
             }
-            p.remaining != 0
+            !done
         });
     }
 
@@ -385,6 +381,14 @@ impl App {
             }
         }
         self.worst_frame = self.worst_frame.max(dt);
+        // NOTE: dt measures the previous frame. Only a frame that dispatched tile work says anything about the budget; idle frames are always fast and would otherwise grow it without bound until the next tiles start with a dispatch long enough to trip the driver's GPU timeout. The frame time includes the vsync wait, so overload shows only past one refresh interval.
+        if self.last_work.0 > 0 {
+            if dt > 0.018 {
+                self.work = (self.work / 2.0).max(MIN_WORK);
+            } else if dt < 0.0169 {
+                self.work *= 1.0625;
+            }
+        }
 
         let level = self.view.target_level().min(MAX_COMPUTE_LEVEL);
         self.update_reference((level + self.lead_levels()).min(MAX_COMPUTE_LEVEL));
@@ -445,13 +449,6 @@ impl App {
         );
         let text_changed = text != self.text;
         self.text = text;
-
-        // NOTE: the frame time includes the vsync wait, so it only signals overload once the work budget pushes past one refresh interval.
-        if dt > 0.018 {
-            self.work = (self.work / 2.0).max(MIN_WORK);
-        } else if dt < 0.0169 {
-            self.work *= 1.0625;
-        }
 
         let globals = Globals {
             screen: [w as f32, h as f32],
