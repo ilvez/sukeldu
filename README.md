@@ -36,9 +36,9 @@ AMD GPU under Linux. Rust + wgpu (Vulkan/RADV) + winit.
   units-per-pixel on a second line. Nothing else on screen.
 - **Reproducible locations.** `C` prints the current location as
   `--at CX CY UPP` to stdout; `sukeldu --at CX CY UPP` starts there.
-  `--perturb-from N` switches tiles at level N and deeper to perturbation
-  (default 36; 0 renders everything but the root tile that way, for
-  comparing the two paths at one location). `--zoom-speed S` starts zooming
+  `--perturb-from N` computes tiles shallower than level N with the direct
+  fp64 shader (default 0: every tile by perturbation), as an exact reference
+  for comparing pictures at one location. `--zoom-speed S` starts zooming
   in at S levels per second, `--zoom-to UPP` stops that zoom at UPP, and
   `--capture T1,T2 PREFIX` writes the frame at those seconds after start
   (or on the frame the zoom stops, for `stop`, or on the first frame with no
@@ -77,19 +77,21 @@ AMD GPU under Linux. Rust + wgpu (Vulkan/RADV) + winit.
   driver's hang timeout. Each finished pixel increments its
   slot's counter on the GPU; the counters are read back asynchronously, and
   a tile is drawn once its counter reaches 65536.
-- **Shaders.** `src/shaders/compute.wgsl` iterates directly in fp64
-  (shallow levels), with the main cardioid / period-2 bulb test and a
-  periodicity check ending interior pixels early.
-  `src/shaders/perturb.wgsl` iterates as deltas
+- **Shaders.** `src/shaders/perturb.wgsl` iterates as deltas
   against a reference orbit, with rebasing, so one reference is valid for
   every pixel, and with bilinear skipping: `src/skip.rs` builds, next to each
   orbit, a table where an entry at level k replaces 2^k steps by one linear
   step, valid while the delta is below the entry's radius. A tile may use it
   only if its farthest pixel is within 2^16 pixels of the reference.
+  Interior pixels end early once |dz_n/dz_1|, carried along the orbit, falls
+  below 1e-6 (the orbit is drawn into an attracting cycle).
   `src/shaders/perturb32.wgsl` is the same in f32 (deltas, orbit and skip
-  table narrowed on upload), used for perturbation tiles up to level 100
+  table narrowed on upload), used for every tile up to level 100
   (`--f32-until N` changes it, 0 turns it off); deeper tiles use the f64
-  shader.
+  shader. Up to level 40 it also skips samples inside the main cardioid and
+  the period-2 bulb.
+  `src/shaders/compute.wgsl` iterates directly in fp64, with the same bulb
+  test and a periodicity check; it only runs below `--perturb-from N`.
   `src/shaders/render.wgsl` maps iteration counts to colours and
   draws the tile quads plus the text overlay.
 - **Reference orbits.** `src/reference.rs` computes one arbitrary-precision
@@ -115,11 +117,9 @@ toward boundary detail, depth readout, 2×2 supersampling in the compute
 shader, fixed palette (hue from log2 of the smooth count, 20% brightness
 banding on the raw count). The view centre is fixed-point arbitrary precision
 (`rug`) and tile keys are big integers, so the zoom itself has no depth limit.
-Tiles from level 36 on are computed by perturbation with f64 deltas, up to
-level 900 (about 1e-273 units per pixel); deeper views magnify the level-900
-tiles. Perturbation has no interior shortcut yet, so interior pixels run to
-the iteration limit (bilinear skipping shortens them only while the orbit
-stays close to the reference).
+Every tile is computed by perturbation, with f32 deltas up to level 100 and
+f64 deltas up to level 900 (about 1e-273 units per pixel); deeper views
+magnify the level-900 tiles.
 
 ## Experiments
 

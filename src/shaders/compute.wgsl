@@ -1,5 +1,6 @@
 struct Tile {
     origin: vec2<f64>,
+    centre: vec2<f64>,
     step: f64,
     layer: u32,
     max_iter: u32,
@@ -10,7 +11,7 @@ struct Tile {
     kernel: u32,
     first: u32,
     steps: u32,
-    unused: u32,
+    bulbs: u32,
 }
 
 struct State {

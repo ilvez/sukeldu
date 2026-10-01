@@ -64,6 +64,10 @@ pub fn spawn(cx: Float, cy: Float, level: u32, max_iter: u32) -> Receiver<Comput
 }
 
 impl Reference {
+    pub fn centre(&self) -> [f64; 2] {
+        [self.cx.to_f64(), self.cy.to_f64()]
+    }
+
     pub fn distance_px(&self, view: &View) -> f64 {
         let (dx, dy) = view.offset_px(&self.cx, &self.cy);
         dx.hypot(dy)

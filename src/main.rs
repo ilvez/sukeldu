@@ -23,9 +23,11 @@ use tiles::{Cache, MAX_COMPUTE_LEVEL, TILE, TileKey, View};
 const LAYERS: u32 = 1536;
 const FALLBACK_LEVELS: u32 = 4;
 const AUTOPILOT_PERIOD: u64 = 15;
-const DEFAULT_PERTURB_FROM_LEVEL: u32 = 36;
+const DEFAULT_PERTURB_FROM_LEVEL: u32 = 0;
 // NOTE: pixel spacing at level 100 is 2^-106, far above f32's smallest normal (2^-126), so the 32-bit deltas keep their precision up to here.
 const DEFAULT_F32_UNTIL_LEVEL: u32 = 100;
+// NOTE: the bulb test sees the pixel as the reference centre rounded to f64 plus its delta, off by about 2^-53; at level 40 that is 1/100 of a pixel, deeper it would misclassify a visible strip along the cardioid.
+const BULB_TEST_UNTIL_LEVEL: u32 = 40;
 const FALLBACK_WALK: u32 = 12;
 const MAX_FALLBACK_UP: u32 = 60;
 const LEAD_SECONDS: f64 = 1.5;
@@ -223,18 +225,9 @@ impl App {
         self.finish_tiles();
         let root = TileKey::root();
         if !self.cache.contains(&root) && !self.free_slots.is_empty() {
-            let layer = self.cache.alloc(root.clone(), self.frame).unwrap();
-            let (ox, oy) = root.origin();
-            let params = TileParams {
-                origin: [ox, oy],
-                step: root.step(),
-                layer,
-                max_iter: self.max_iter(0),
-                samples: self.samples,
-                kernel: Kernel::Direct as u32,
-                ..Default::default()
-            };
-            self.start_tile(root.clone(), params);
+            if let Some(located) = self.located(&root) {
+                self.start(root.clone(), located, self.max_iter(0));
+            }
         }
         self.cache.get(&root, self.frame);
 
@@ -270,14 +263,8 @@ impl App {
                     }
                     let (dx, dy) = ((x0 + x1) / 2.0 - focus.0, (y0 + y1) / 2.0 - focus.1);
                     let d = (dx * dx + dy * dy).sqrt();
-                    let located = if l >= self.perturb_from {
-                        let Some(located) = self.reference.as_ref().and_then(|r| r.locate(&key))
-                        else {
-                            continue;
-                        };
-                        Some(located)
-                    } else {
-                        None
+                    let Some(located) = self.located(&key) else {
+                        continue;
                     };
                     wanted.push((d + (l as f64 - level as f64) * 1e9, key, located));
                 }
@@ -285,32 +272,8 @@ impl App {
             wanted.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
             let free = self.free_slots.len();
             for (_, key, located) in wanted.into_iter().take(free) {
-                let Some(layer) = self.cache.alloc(key.clone(), self.frame) else {
-                    continue;
-                };
-                let (origin, kernel, use_skip) = match located {
-                    Some(located) if key.level <= self.f32_until => {
-                        (located.offset, Kernel::Perturb32, located.skip)
-                    }
-                    Some(located) => (located.offset, Kernel::Perturb, located.skip),
-                    None => {
-                        let (ox, oy) = key.origin();
-                        ([ox, oy], Kernel::Direct, false)
-                    }
-                };
-                let params = TileParams {
-                    origin,
-                    step: key.step(),
-                    layer,
-                    max_iter: self.max_iter(key.level.max(level)),
-                    samples: self.samples,
-                    ref_len: self.reference.as_ref().map_or(0, |r| r.len),
-                    skip_p: self.reference.as_ref().map_or(0, |r| r.skip_p),
-                    use_skip: use_skip as u32,
-                    kernel: kernel as u32,
-                    ..Default::default()
-                };
-                self.start_tile(key, params);
+                let max_iter = self.max_iter(key.level.max(level));
+                self.start(key, located, max_iter);
             }
         }
 
@@ -327,6 +290,45 @@ impl App {
             };
         }
         tiles
+    }
+
+    // NOTE: None means the tile needs perturbation but no reference covers it yet; Some(None) routes it to the direct kernel.
+    fn located(&self, key: &TileKey) -> Option<Option<Located>> {
+        if key.level < self.perturb_from {
+            return Some(None);
+        }
+        self.reference.as_ref()?.locate(key).map(Some)
+    }
+
+    fn start(&mut self, key: TileKey, located: Option<Located>, max_iter: u32) {
+        let Some(layer) = self.cache.alloc(key.clone(), self.frame) else {
+            return;
+        };
+        let (origin, kernel, use_skip) = match located {
+            Some(located) if key.level <= self.f32_until => {
+                (located.offset, Kernel::Perturb32, located.skip)
+            }
+            Some(located) => (located.offset, Kernel::Perturb, located.skip),
+            None => {
+                let (ox, oy) = key.origin();
+                ([ox, oy], Kernel::Direct, false)
+            }
+        };
+        let params = TileParams {
+            origin,
+            centre: self.reference.as_ref().map_or([0.0; 2], |r| r.centre()),
+            bulbs: (key.level <= BULB_TEST_UNTIL_LEVEL) as u32,
+            step: key.step(),
+            layer,
+            max_iter,
+            samples: self.samples,
+            ref_len: self.reference.as_ref().map_or(0, |r| r.len),
+            skip_p: self.reference.as_ref().map_or(0, |r| r.skip_p),
+            use_skip: use_skip as u32,
+            kernel: kernel as u32,
+            ..Default::default()
+        };
+        self.start_tile(key, params);
     }
 
     fn start_tile(&mut self, key: TileKey, params: TileParams) {

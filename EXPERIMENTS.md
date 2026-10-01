@@ -18,7 +18,10 @@ capture, worst frame.
 
 Locations: minibrot in dust and spiral valley from the README (levels 36 and
 33 on arrival), and each 8 levels deeper (minibrot+8 at level 44, spiral+8
-at level 41).
+at level 41). From the seven-location table on, also each 16 levels
+shallower (minibrot-16 at level 20, spiral-16 at level 17), and `bulbs`, the
+root between the main cardioid and the period-3 bulb at level 9 (94%
+interior, black fraction 0.94 in every run).
 
 The app runs on the Hyprland workspace `test:a` with its own app id, so it
 never takes focus, and without vsync, because the compositor throttles a
@@ -85,6 +88,42 @@ The frame on which the preview is captured is itself slow (about 100 ms:
 the capture waits for the GPU and writes the file), so the worst frame of
 a whole run is not counted past the preview capture.
 
+### Seven locations, hidden window, zoom, settled capture
+
+Same conditions as the previous table; the first row repeats its last build.
+
+| Build | minibrot | spiral | minibrot+8 | spiral+8 | minibrot-16 | spiral-16 | bulbs |
+|---|---|---|---|---|---|---|---|
+| direct up to level 35 | 42.0 / 0.51, 19 of 557, 40 ms, 15.3 s | 1.5 / 0.00, 8 of 545, 38 ms, 4.4 s | 26.8 / 0.34, 5 of 594, 34 ms, 20.4 s | 3.5 / 0.01, 0 of 581, 24 ms, 5.0 s | 66.8 / 0.67, 24 of 563, 45 ms, 17.1 s | 0.6 / 0.01, 6 of 9110, 53 ms, 4.1 s | 1.3 / 0.01, 2 of 4233, 42 ms, 5.2 s |
+| all levels by perturbation, no interior test | 44.6 / 0.53, 20 of 618, 32 ms, 14.3 s | 0.9 / 0.00, 2 of 562, 27 ms, 4.2 s | 30.2 / 0.39, 12 of 614, 33 ms, 20.8 s | 3.3 / 0.00, 0 of 623, 18 ms, 5.0 s | 52.8 / 0.58, 13 of 602, 29 ms, 13.4 s | 0.6 / 0.01, 4 of 8967, 45 ms, 4.1 s | 2.6 / 0.02, 3 of 469, 27 ms, 8.1 s |
+| + interior test (complex dz/dz1, bulb test) | 44.6 / 0.53, 22 of 570, 39 ms, 16.0 s | 1.2 / 0.00, 3 of 502, 31 ms, 4.3 s | 27.4 / 0.35, 11 of 599, 33 ms, 22.8 s | 5.0 / 0.01, 0 of 559, 25 ms, 5.2 s | 58.4 / 0.62, 5 of 616, 29 ms, 15.1 s | 0.6 / 0.01, 5 of 8745, 49 ms, 4.1 s | 1.3 / 0.01, 2 of 5700, 39 ms, 4.7 s |
+| same, \|dz/dz1\|² only | 42.1 / 0.51, 19 of 595, 33 ms, 14.7 s | 1.2 / 0.00, 2 of 549, 27 ms, 4.3 s | 29.8 / 0.39, 9 of 592, 33 ms, 21.6 s | 3.5 / 0.01, 0 of 601, 19 ms, 5.1 s | 53.1 / 0.58, 1 of 642, 26 ms, 13.8 s | 0.6 / 0.01, 3 of 9508, 45 ms, 4.1 s | 1.3 / 0.01, 1 of 7119, 42 ms, 4.6 s |
+| same, as the default, root tile included | 42.0 / 0.51, 16 of 608, 35 ms, 14.7 s | 1.2 / 0.00, 2 of 548, 28 ms, 4.3 s | 29.8 / 0.39, 5 of 625, 29 ms, 21.5 s | 3.8 / 0.01, 0 of 602, 23 ms, 5.0 s | 54.4 / 0.59, 1 of 637, 26 ms, 13.9 s | 0.6 / 0.01, 3 of 9439, 45 ms, 4.1 s | 1.3 / 0.01, 1 of 7129, 35 ms, 4.6 s |
+
+### Seven locations, static views, settle time
+
+| Build | minibrot | spiral | minibrot+8 | spiral+8 | minibrot-16 | spiral-16 | bulbs |
+|---|---|---|---|---|---|---|---|
+| direct up to level 35 | 11.9 s | 1.3 s | 16.7 s | 2.1 s | 13.9 s | 0.38 s | 2.4 s |
+| all levels by perturbation, no interior test | 10.7 s | 0.9 s | 16.8 s | 2.1 s | 10.4 s | 0.39 s | 5.2 s |
+| + interior test (complex dz/dz1, bulb test) | 12.2 s | 1.1 s | 18.9 s | 2.4 s | 12.0 s | 0.41 s | 1.1 s |
+| same, \|dz/dz1\|² only | 11.1 s | 0.95 s | 17.6 s | 2.2 s | 10.8 s | 0.38 s | 1.0 s |
+| same, as the default, root tile included | 11.1 s | 0.95 s | 17.5 s | 2.2 s | 10.9 s | 0.37 s | 1.0 s |
+
+### Seven locations, settled pictures compared, share of pixels differing by more than 32
+
+| Comparison | minibrot | spiral | minibrot+8 | spiral+8 | minibrot-16 | spiral-16 | bulbs |
+|---|---|---|---|---|---|---|---|
+| all perturbation (f32) vs direct up to level 35 | identical | 0.0008 | identical | identical | 0.40 | 0.028 | 0.009 |
+| all perturbation in f64 (`--f32-until 0`) vs direct | not run | not run | not run | not run | 0.22 | 0.0011 | not run |
+| interior test vs none (bit-identical expected) | identical | identical | identical | identical | identical | identical | identical |
+| \|dz/dz1\|² vs complex dz/dz1 | identical | identical | identical | identical | identical | identical | identical |
+| default vs `--perturb-from 0` | identical | identical | identical | identical | identical | identical | identical |
+
+At minibrot-16 the f32 and f64 pictures both differ from direct fp64 only
+in dust, as in the 64-bit vs 32-bit comparison above; at half-size they
+cannot be told apart.
+
 ### Static views, settled pictures compared between builds
 
 | Comparison | minibrot | spiral | minibrot+8 | spiral+8 |
@@ -128,20 +167,31 @@ counts differ by thousands; shapes and smooth regions match.
   budget / pixels still iterating) removed the spikes.
 - **64-bit floats are not needed for most of the range.** Perturbation
   deltas need relative, not absolute, precision; 32-bit holds them down to
-  about 1e-38 (level ~110). 64-bit is needed by the direct path between
-  levels ~12 and 36, and by perturbation past level 100.
+  about 1e-38 (level ~110). With perturbation at every level, 64-bit is
+  only needed past level 100.
+- **Perturbation replaces the direct path once it has an interior test.**
+  On batched dispatch with f32 deltas, perturbation from level 0 settles
+  the shallow locations as fast as direct fp64 or faster (minibrot-16 10.9
+  against 13.9 s) and previews them better (54 against 67 mean
+  difference), except where interior dominates: `bulbs` took 5.2 s against
+  2.4 s until the interior test, 1.0 s with it. The derivative test is
+  scale-free, so it also holds at depth; tracking only |dz/dz1|² (one
+  multiply per step, reusing |z|² from the bailout check) costs 3 to 5% at
+  the deep locations, where it finds no interior; the complex derivative
+  cost 10 to 14%. Neither changed a single pixel at any location.
 
 ## Where to pick up
 
 1. Verify 32-bit perturbation deeper than level 44: record a location near
    level 80 to 100 (press `C` there) and compare settled 64-bit and 32-bit
    pictures, as in the static comparison table.
-2. The minibrot preview (level 36) is still the weakest score: interior and
-   near-interior pixels run to the cap in perturbation. An interior test in
-   the perturbation shaders, then perturbation from a shallower level so the
-   fast 32-bit path also covers levels 12 to 36.
+2. The minibrot previews (levels 20 to 44) are still the weakest scores.
+   Their views have no interior (black fraction 0), so the interior test
+   does not help there.
 3. More slots in flight (12 now, 4 MB of state each) once the scheduler can
-   keep them filled with useful tiles.
+   keep them filled with useful tiles. The state stride is 64 bytes because
+   the direct shader's `State` needs it; perturb32 uses 32, so a stride per
+   kernel would halve the default path's state.
 4. The remaining slow frames (about 1 in 80) are the budget probing upward
    and halving; a gentler increase or a smoothed frame time would remove
    most of them.
@@ -161,7 +211,8 @@ Nothing is committed yet.
 | `STEP_CAP` 2048 | rejected | No better than 4096. |
 | `STEP_CAP` 256 | superseded | Perturbation zoom (minibrot+8) went from 61 slow frames to 1; replaced by the per-frame budget of batched dispatch. |
 | Per-slice finished-pixel counter on the GPU, read back asynchronously | kept, now per tile | Neutral at 4096-step slices; with batched dispatch it is how the CPU learns that a tile is done. |
-| All levels by perturbation (`--perturb-from 0`) | rejected | Smooth frames, but previews much blurrier and settling 3 times slower: no interior test. |
+| All levels by perturbation (`--perturb-from 0`), per-slice dispatch, f64 | rejected | Smooth frames, but previews much blurrier and settling 3 times slower: no interior test. |
+| All levels by perturbation, batched dispatch, f32, with the interior test | kept, default; `--perturb-from N` keeps the direct shader as an exact reference | Same or faster settling at every location, better shallow previews; pictures differ from direct fp64 only in dust. |
 | Resumable direct tiles: `compute.wgsl` iterates in chunks like the perturbation path | kept | Remaining slow frames gone at the shallow locations (worst 21 to 26 ms, from 100 ms). Bit-identical to one-pass. |
 | Exact zoom stop for test runs | kept | Runs end on identical views, so settled pictures compare between builds. |
 | 32-bit perturbation deltas, orbit and skip table (`perturb32.wgsl`) | kept, default up to level 100 | 1.3 times faster on per-slice dispatch, 2 to 2.6 times on batched dispatch; pictures match except colour noise in dust. Verified at levels 36 to 44. |
@@ -170,6 +221,7 @@ Nothing is committed yet.
 | Per-frame budget in pixel-steps, costed by pixels still iterating | superseded | Slow frames 10 to 16 per 600, worst 31 to 43 ms, but it hung the GPU on a laptop (Radeon 780M, "context is guilty of a hard recovery"): the budget grew on idle frames without limit, and scattered unfinished pixels were costed as nearly free. |
 | Per-frame budget in pixel-steps, costed by whole in-flight tiles, adjusted only on frames that dispatched work | kept | Same throughput; still a 100 ms frame when the budget grown on cheap tiles met dense ones. |
 | At most 1024 steps per pixel per frame | kept | Bounds the worst dispatch on any GPU; worst zoom frame 24 to 39 ms, same settle times. Not yet re-tested on the laptop. |
-| Interior test in the perturbation shader | not tried | Needed before perturbation can replace the direct path. |
+| Interior test in the perturbation shaders: \|dz/dz1\|² below 1e-12, plus the main cardioid / period-2 bulb test up to level 40 | kept | `bulbs` settles in 1.0 s, from 5.2 s; bit-identical pictures everywhere. |
+| Same with the complex derivative dz/dz1 | superseded | Same pictures, 6 to 10% slower at the deep locations than \|dz/dz1\|² alone. |
 | More tiles in flight (more state slots) | not tried | |
 | Paint cap-hit pixels with the cap count's colour instead of black; black only for proven interior | not tried | Needs a decision on how minibrots look in the perturbation regime. |

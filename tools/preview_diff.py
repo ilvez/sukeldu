@@ -17,8 +17,9 @@ With --zoom SPEED the app starts LEVELS levels shallower and zooms into the
 location at SPEED levels per second, stopping there; the early capture is
 the frame on which it arrives, so it shows what the look-ahead had ready.
 
-    python tools/preview_diff.py [--early S] [--timeout S] [--tag NAME]
-                                 [--zoom SPEED --levels N] [-- APP_ARGS...]
+    python tools/preview_diff.py [--early S] [--timeout S] [--tag NAME] [--only PREFIX]
+                                 [--zoom SPEED --levels N] [--compare OTHER_TAG]
+                                 [-- APP_ARGS...]
 """
 
 import argparse
@@ -46,6 +47,9 @@ LOCATIONS = [
     ("spiral", "-0.7436438870371587", "0.1318259042053119", "2.0e-12"),
     ("minibrot+8", "-0.7394310682635371", "-0.1268495465745192", "1.665e-15"),
     ("spiral+8", "-0.7436438870371587", "0.1318259042053119", "7.8125e-15"),
+    ("minibrot-16", "-0.7394310682635371", "-0.1268495465745192", "2.79379968e-8"),
+    ("spiral-16", "-0.7436438870371587", "0.1318259042053119", "1.31072e-7"),
+    ("bulbs", "-0.125", "0.6495", "2.5e-5"),
 ]
 
 
@@ -57,18 +61,46 @@ def main():
     parser.add_argument("--only", help="location name prefix")
     parser.add_argument("--zoom", type=float, help="zoom speed in levels per second")
     parser.add_argument("--levels", type=int, default=8, help="levels to zoom through")
+    parser.add_argument("--compare", metavar="TAG", help="compare settled pictures with run TAG")
     parser.add_argument("app_args", nargs="*")
     args = parser.parse_args()
     OUT.mkdir(parents=True, exist_ok=True)
 
     subprocess.run(["hyprctl", "eval", WINDOW_RULE], check=True, capture_output=True)
-    print("| location | black early | black late | mean diff | pixels > 32 | slow frames | worst |")
-    print("|---|---|---|---|---|---|---|")
+    print(
+        "| location | black early | black late | mean diff | pixels > 32 "
+        "| slow frames | worst | settled after |"
+    )
+    print("|---|---|---|---|---|---|---|---|")
+    names = [loc[0] for loc in LOCATIONS if not args.only or loc[0].startswith(args.only)]
     for name, cx, cy, upp in LOCATIONS:
-        if args.only and not name.startswith(args.only):
+        if name not in names:
             continue
         early, late, frames = capture(name, cx, cy, upp, args)
-        print(score_row(name, early, late) + frames)
+        print(score_row(name, early, late) + frames + settle_time(OUT / f"{args.tag}_{name}"))
+    if args.compare:
+        compare(args.tag, args.compare, names)
+
+
+def compare(tag, other, names):
+    print(f"\n| location | settled {tag} vs {other}: identical | mean diff | pixels > 32 |")
+    print("|---|---|---|---|")
+    for name in names:
+        ours = load(OUT / f"{tag}_{name}_settled.ppm")
+        theirs = load(OUT / f"{other}_{name}_settled.ppm")
+        if ours is None or theirs is None or ours.shape != theirs.shape:
+            print(f"| {name} | missing or different size | - | - |")
+            continue
+        diff = np.abs(ours - theirs).max(axis=2)
+        print(
+            f"| {name} | {(diff == 0).mean():.4f} | {diff.mean():.2f} "
+            f"| {(diff > DIFF_THRESHOLD).mean():.4f} |"
+        )
+
+
+def settle_time(prefix):
+    match = re.search(r"_settled\.ppm: ([\d.]+)s", Path(f"{prefix}.log").read_text())
+    return f" {match.group(1)} s |" if match else " - |"
 
 
 def capture(name, cx, cy, upp, args):
@@ -90,7 +122,7 @@ def capture(name, cx, cy, upp, args):
         app = subprocess.Popen(cmd + app_args, stdout=log, stderr=subprocess.STDOUT)
         try:
             deadline = time.monotonic() + args.timeout
-            while time.monotonic() < deadline and not settled_written(prefix, late_path):
+            while time.monotonic() < deadline and not written(prefix, [early_path, late_path]):
                 time.sleep(0.5)
         finally:
             app.terminate()
@@ -98,8 +130,9 @@ def capture(name, cx, cy, upp, args):
     return load(early_path), load(late_path), frame_stats(prefix, early_path)
 
 
-def settled_written(prefix, late_path):
-    return str(late_path) in Path(f"{prefix}.log").read_text()
+def written(prefix, paths):
+    log = Path(f"{prefix}.log").read_text()
+    return all(str(path) in log for path in paths)
 
 
 def frame_stats(prefix, early_path):

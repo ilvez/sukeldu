@@ -1,5 +1,6 @@
 struct Tile {
     origin: vec2<f64>,
+    centre: vec2<f64>,
     step: f64,
     layer: u32,
     max_iter: u32,
@@ -10,7 +11,7 @@ struct Tile {
     kernel: u32,
     first: u32,
     steps: u32,
-    unused: u32,
+    bulbs: u32,
 }
 
 struct Skip {
@@ -23,12 +24,13 @@ struct Skip {
 struct State {
     dx: f64,
     dy: f64,
+    der2: f32,
     sum: f32,
     inside: u32,
     m: u32,
     n: u32,
     sample: u32,
-    unused: array<u32, 7>,
+    unused: array<u32, 6>,
 }
 
 @group(0) @binding(0) var<storage, read> tiles: array<Tile>;
@@ -43,6 +45,12 @@ var<private> p: Tile;
 const KERNEL: u32 = 2u;
 const TILE: u32 = 256u;
 const UNFINISHED: f32 = -2.0;
+const INTERIOR: f32 = 1e-12;
+const DER_RESCALE: f32 = 1e32;
+
+fn fresh(sum: f32, inside: u32, sample: u32) -> State {
+    return State(f64(0.0), f64(0.0), 1.0, sum, inside, 0u, 0u, sample, array<u32, 6>());
+}
 
 // Returns the smooth count once the sample escapes, -1 when it reaches max_iter, UNFINISHED when the per-dispatch budget ran out first.
 fn advance(dcx: f64, dcy: f64, st: ptr<function, State>, spent: ptr<function, u32>) -> f32 {
@@ -52,8 +60,11 @@ fn advance(dcx: f64, dcy: f64, st: ptr<function, State>, spent: ptr<function, u3
     let top = 31u - countLeadingZeros(p.skip_p);
     var dx = (*st).dx;
     var dy = (*st).dy;
+    var der2 = (*st).der2;
     var m = (*st).m;
     var n = (*st).n;
+    let z0 = orbit[m];
+    var zmag = f32((z0.x + dx) * (z0.x + dx) + (z0.y + dy) * (z0.y + dy));
     var result = UNFINISHED;
     loop {
         if (n >= p.max_iter) {
@@ -65,6 +76,7 @@ fn advance(dcx: f64, dcy: f64, st: ptr<function, State>, spent: ptr<function, u3
         }
         var ndx = f64(0.0);
         var ndy = f64(0.0);
+        var gain: f32 = 1.0;
         var len: u32 = 0u;
         // NOTE: bilinear skip. An entry at level k replaces 2^k steps by delta' = a * delta + b * dc, valid while |delta| is below its radius; the longest valid one starting at orbit index m is taken (only indices divisible by 2^k start a level-k entry).
         if (p.use_skip != 0u) {
@@ -80,6 +92,7 @@ fn advance(dcx: f64, dcy: f64, st: ptr<function, State>, spent: ptr<function, u3
                     if (dmag < e.radius * e.radius) {
                         ndx = e.a.x * dx - e.a.y * dy + e.b.x * dcx - e.b.y * dcy;
                         ndy = e.a.x * dy + e.a.y * dx + e.b.x * dcy + e.b.y * dcx;
+                        gain = f32(e.a.x * e.a.x + e.a.y * e.a.y);
                         len = l;
                         break;
                     }
@@ -91,8 +104,12 @@ fn advance(dcx: f64, dcy: f64, st: ptr<function, State>, spent: ptr<function, u3
             let z = orbit[m];
             ndx = two * (z.x * dx - z.y * dy) + dx * dx - dy * dy + dcx;
             ndy = two * (z.x * dy + z.y * dx) + two * dx * dy + dcy;
+            if (n != 0u) {
+                gain = 4.0 * zmag;
+            }
             len = 1u;
         }
+        der2 = der2 * gain;
         m = m + len;
         n = n + len;
         *spent = *spent + len;
@@ -105,6 +122,15 @@ fn advance(dcx: f64, dcy: f64, st: ptr<function, State>, spent: ptr<function, u3
             result = f32(n) + 3.0 - log2(0.5 * log2(f32(mag)));
             break;
         }
+        // NOTE: interior test on |dz_n/dz_1|^2, as in perturb32.wgsl; f32 is enough because only its size relative to 1 matters.
+        if (der2 < INTERIOR) {
+            result = -1.0;
+            break;
+        }
+        if (der2 > DER_RESCALE) {
+            der2 = der2 * 1e-16;
+        }
+        zmag = f32(mag);
         // NOTE: rebasing. When the full orbit value is smaller than the delta, or the reference orbit ends, continue with the full value against the start of the reference; this is what makes one reference valid for every pixel.
         if (mag < ndx * ndx + ndy * ndy || m == last) {
             dx = fx;
@@ -117,6 +143,7 @@ fn advance(dcx: f64, dcy: f64, st: ptr<function, State>, spent: ptr<function, u3
     }
     (*st).dx = dx;
     (*st).dy = dy;
+    (*st).der2 = der2;
     (*st).m = m;
     (*st).n = n;
     return result;
@@ -134,7 +161,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let s = max(p.samples, 1u);
     let total = s * s;
     let idx = slot * TILE * TILE + py * TILE + px;
-    var st = State(f64(0.0), f64(0.0), 0.0, 0u, 0u, 0u, 0u, array<u32, 7>());
+    var st = fresh(0.0, 0u, 0u);
     if (p.first == 0u) {
         st = state[idx];
     }
@@ -160,11 +187,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         } else {
             st.sum = st.sum + v;
         }
-        st.dx = f64(0.0);
-        st.dy = f64(0.0);
-        st.m = 0u;
-        st.n = 0u;
-        st.sample = st.sample + 1u;
+        st = fresh(st.sum, st.inside, st.sample + 1u);
     }
     state[idx] = st;
     if (st.sample >= total) {

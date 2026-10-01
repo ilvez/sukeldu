@@ -17,6 +17,7 @@ pub const TILE_PIXELS: u32 = TILE * TILE;
 #[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct TileParams {
     pub origin: [f64; 2],
+    pub centre: [f64; 2],
     pub step: f64,
     pub layer: u32,
     pub max_iter: u32,
@@ -27,7 +28,7 @@ pub struct TileParams {
     pub kernel: u32,
     pub first: u32,
     pub steps: u32,
-    pub _pad: u32,
+    pub bulbs: u32,
 }
 
 #[repr(C)]
